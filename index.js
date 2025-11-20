@@ -8,89 +8,70 @@ const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
 const app = express();
 app.use(express.json());
 
-// Создаём бота через WebHook
-const bot = new TelegramBot(TOKEN, { webHook: true });
+// Стартуем бота в режиме webhook
+const bot = new TelegramBot(TOKEN, {
+  webHook: {
+    port: process.env.PORT || 10000
+  }
+});
 
-// Устанавливаем webhook URL
+// Устанавливаем webhook в Telegram
 bot.setWebHook(`${RENDER_URL}/webhook/${TOKEN}`);
 
-// Webhook endpoint — Telegram отправляет сюда обновления
+console.log("Webhook set:", `${RENDER_URL}/webhook/${TOKEN}`);
+
+// Принимаем webhook от Telegram
 app.post(`/webhook/${TOKEN}`, (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
 });
 
-// Проверка сервера
+// Проверка что сервер жив
 app.get("/", (req, res) => {
   res.send("BOT OK");
 });
 
-// WebApp endpoint — HTML плеер
-app.get("/webapp", (req, res) => {
-  res.sendFile("/opt/render/project/src/webapp.html");
-});
-
-// Ловим канальные посты (для дебага)
-bot.on("channel_post", (msg) => {
-  console.log("CHANNEL_POST:", msg.chat.id, msg.chat.title);
+// Логируем любые входящие сообщения
+bot.on("message", (msg) => {
+  console.log("INCOMING MESSAGE:", JSON.stringify(msg, null, 2));
 });
 
 // Команда /start
 bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, "Бот работает. Пришли ссылку на стрим.");
+  bot.sendMessage(msg.chat.id, "Бот работает. Отправь ссылку на стрим.");
 });
 
-// Ловим сообщения
+// Основная логика — ловим ссылку
 bot.on("message", async (msg) => {
-  // ЛОГИРУЕМ ВСЁ, ЧТО ПРИХОДИТ
-  console.log("INCOMING MESSAGE:", JSON.stringify(msg, null, 2));
+  if (!msg.text) return;
+  if (msg.chat.type === "channel") return;
 
-  const text = msg.text;
-  if (!text || msg.chat.type === "channel") return;
+  const text = msg.text.trim();
 
   // Проверяем, что это ссылка
-  if (!(text.startsWith("http://") || text.startsWith("https://"))) return;
+  if (!text.startsWith("http://") && !text.startsWith("https://")) return;
 
-  const url = text.trim();
-
-  // Проверяем YouTube
-  const isYouTube =
-    url.includes("youtube.com") ||
-    url.includes("youtu.be");
-
-  let button;
-
-  if (isYouTube) {
-    // YouTube встроится нативно в Telegram
-    button = {
-      inline_keyboard: [
-        [{ text: "🎥 Смотреть стрим", url: url }]
-      ]
-    };
-  } else {
-    // Все другие платформы — WebApp страница
-    const webappUrl = `${RENDER_URL}/webapp?src=${encodeURIComponent(url)}`;
-
-    button = {
-      inline_keyboard: [
-        [{
-          text: "🎥 Смотреть стрим",
-          web_app: { url: webappUrl }
-        }]
-      ]
-    };
-  }
+  // Строим ссылку на WebApp
+  const webAppUrl = `${RENDER_URL}/webapp?src=${encodeURIComponent(text)}`;
 
   try {
-    await bot.sendMessage(
-      CHANNEL_ID,
-      "🔴 Стрим сейчас!",
-      { reply_markup: button }
-    );
+    // Отправка в канал
+    await bot.sendMessage(CHANNEL_ID, "🔴 Стрим сейчас!", {
+      reply_markup: {
+        inline_keyboard: [[
+          {
+            text: "🎥 Смотреть стрим",
+            url: webAppUrl   // ← правильно для каналов
+          }
+        ]]
+      }
+    });
 
-    await bot.sendMessage(msg.chat.id, "Опубликовано.");
-  } catch (err) {
-    console.error("SEND ERROR:", err); // <<< ВАЖНО: лог ошибки
+    // Ответ пользователю
+    await bot.sendMessage(msg.chat.id, "Опубликовано в канале.");
+  } catch (e) {
+    console.error("SEND ERROR:", e);
+
     await bot.sendMessage(
       msg.chat.id,
       "Ошибка: не могу отправить сообщение в канал. Проверь, что я админ."
@@ -98,6 +79,19 @@ bot.on("message", async (msg) => {
   }
 });
 
-// Запуск сервера
-const PORT = process.env.PORT;
-app.listen(PORT, () => console.log("SERVER RUNNING", PORT));
+// WebApp endpoint
+app.get("/webapp", (req, res) => {
+  const streamUrl = req.query.src || "";
+
+  res.send(`
+    <html>
+      <body style="margin:0;background:#000;">
+        <iframe
+          src="${streamUrl}"
+          style="width:100%;height:100%;border:0;"
+          allowfullscreen>
+        </iframe>
+      </body>
+    </html>
+  `);
+});
