@@ -30,7 +30,7 @@ app.get("/webapp", (req, res) => {
   res.sendFile("/opt/render/project/src/webapp.html");
 });
 
-// Ловим канальные посты (для определения channel_id)
+// Ловим канальные посты (для дебага)
 bot.on("channel_post", (msg) => {
   console.log("CHANNEL_POST:", msg.chat.id, msg.chat.title);
 });
@@ -40,11 +40,15 @@ bot.onText(/\/start/, (msg) => {
   bot.sendMessage(msg.chat.id, "Бот работает. Пришли ссылку на стрим.");
 });
 
-// Ловим ссылки
+// Ловим сообщения
 bot.on("message", async (msg) => {
+  // ЛОГИРУЕМ ВСЁ, ЧТО ПРИХОДИТ
+  console.log("INCOMING MESSAGE:", JSON.stringify(msg, null, 2));
+
   const text = msg.text;
   if (!text || msg.chat.type === "channel") return;
 
+  // Проверяем, что это ссылка
   if (!(text.startsWith("http://") || text.startsWith("https://"))) return;
 
   const url = text.trim();
@@ -78,15 +82,15 @@ bot.on("message", async (msg) => {
   }
 
   try {
-    // публкуем пост в канале
     await bot.sendMessage(
       CHANNEL_ID,
-      `🔴 Стрим сейчас!`,
+      "🔴 Стрим сейчас!",
       { reply_markup: button }
     );
 
     await bot.sendMessage(msg.chat.id, "Опубликовано.");
   } catch (err) {
+    console.error("SEND ERROR:", err); // <<< ВАЖНО: лог ошибки
     await bot.sendMessage(
       msg.chat.id,
       "Ошибка: не могу отправить сообщение в канал. Проверь, что я админ."
