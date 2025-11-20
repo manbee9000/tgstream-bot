@@ -1,18 +1,33 @@
 import express from "express";
 import TelegramBot from "node-telegram-bot-api";
 
-const TOKEN = process.env.BOT_TOKEN;       // токен бота из Render
-const CHANNEL_ID = process.env.CHANNEL_ID; // id канала также из Render
-
-// Важно: polling ОК, пока у нас нет вебхуков
-const bot = new TelegramBot(TOKEN, { polling: true });
+const TOKEN = process.env.BOT_TOKEN;
+const CHANNEL_ID = process.env.CHANNEL_ID;
 
 const app = express();
 app.use(express.json());
 
-// Проверка, что сервер жив
+// Создаём бота через WEBHOOK (НЕ polling!)
+const bot = new TelegramBot(TOKEN, { webHook: true });
+
+// Webhook URL от Render
+const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
+bot.setWebHook(`${RENDER_URL}/webhook/${TOKEN}`);
+
+// Ручка, куда Telegram будет слать обновления
+app.post(`/webhook/${TOKEN}`, (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
+});
+
+// Проверка работоспособности сервера
 app.get("/", (req, res) => {
   res.send("TGSTREAM BOT IS RUNNING");
+});
+
+// Логируем канальные посты
+bot.on("channel_post", (msg) => {
+  console.log("CHANNEL POST DETECTED:", msg.chat.id, msg.chat.title);
 });
 
 // Команда /start
@@ -20,50 +35,29 @@ bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
     "Привет! Я бот для стримеров.\n\n" +
-    "Отправь мне ссылку на стрим (YouTube, Twitch), и я создам пост для твоего Telegram-канала."
+    "Отправь мне ссылку на стрим — и я создам пост в твоём канале."
   );
 });
 
-// Ловим события канала (чтобы узнать channel_id)
-bot.on("channel_post", (msg) => {
-  console.log("CHANNEL POST DETECTED:");
-  console.log("chat.id =", msg.chat.id);
-  console.log("title =", msg.chat.title);
-});
-
-// Ловим любые сообщения
+// Ловим ссылки
 bot.on("message", async (msg) => {
   const text = msg.text;
 
-  // Игнорируем сообщения из каналов (кроме channel_post)
   if (!text || msg.chat.type === "channel") return;
 
-  // Если это похоже на ссылку
   if (text.startsWith("http://") || text.startsWith("https://")) {
-    await bot.sendMessage(msg.chat.id, "Создаю пост в канал…");
+    await bot.sendMessage(msg.chat.id, "Создаю пост…");
 
     try {
       await bot.sendMessage(
         CHANNEL_ID,
-        `🔴 *СТРИМ СЕЙЧАС!*\n\n${text}`,
+        `🔴 *Стрим сейчас!*\n${text}`,
         { parse_mode: "Markdown" }
       );
 
-      await bot.sendMessage(msg.chat.id, "Готово! Пост опубликован 🎉");
+      bot.sendMessage(msg.chat.id, "Готово! Пост опубликован 🎉");
     } catch (err) {
-      console.error("Ошибка публикации:", err);
-      await bot.sendMessage(
+      bot.sendMessage(
         msg.chat.id,
-        "⚠️ Ошибка! Я не могу отправить сообщение в канал.\n" +
-        "Проверь, что бот — администратор канала."
-      );
-    }
-  }
-});
-
-// Запуск сервера (ВАЖНО: только process.env.PORT)
-const PORT = process.env.PORT;
-app.listen(PORT, () => {
-  console.log("Server running on port", PORT);
-});
+        "⚠️ Не могу отправить в канал. Проверь, что я админ."
 
