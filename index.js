@@ -25,7 +25,7 @@ app.get("/", (req, res) => {
   res.send("TGSTREAM BOT IS RUNNING");
 });
 
-// Логируем канальные посты
+// Ловим события канала (узнать CHANNEL_ID)
 bot.on("channel_post", (msg) => {
   console.log("CHANNEL POST DETECTED:", msg.chat.id, msg.chat.title);
 });
@@ -35,7 +35,7 @@ bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
     "Привет! Я бот для стримеров.\n\n" +
-    "Отправь мне ссылку на стрим — и я создам пост в твоём канале."
+      "Отправь мне ссылку на стрим — и я создам пост в твоём канале."
   );
 });
 
@@ -60,4 +60,11 @@ bot.on("message", async (msg) => {
       bot.sendMessage(
         msg.chat.id,
         "⚠️ Не могу отправить в канал. Проверь, что я админ."
+      );
+    }
+  }
+});
 
+// Запуск сервера
+const PORT = process.env.PORT;
+app.listen(PORT, () => console.log("Server running on port", PORT));
