@@ -1,14 +1,13 @@
 {
   "name": "tgstream-bot",
   "version": "1.0.0",
-  "description": "Telegram streaming bot",
   "main": "index.js",
   "type": "module",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "node-telegram-bot-api": "^0.60.0"
+    "express": "^4.19.2",
+    "node-telegram-bot-api": "^0.61.0"
   }
 }
