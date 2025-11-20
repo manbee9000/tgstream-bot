@@ -1,14 +1,14 @@
 {
   "name": "tgstream-bot",
   "version": "1.0.0",
-  "description": "Telegram bot for stream embedding into Telegram channels",
+  "description": "Telegram streaming bot",
   "main": "index.js",
   "type": "module",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "node-fetch": "^3.3.2",
-    "telegraf": "^4.12.2"
+    "express": "^4.18.2",
+    "node-telegram-bot-api": "^0.60.0"
   }
 }
