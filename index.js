@@ -8,13 +8,13 @@ const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
 const app = express();
 app.use(express.json());
 
-// создаём бота через Webhook
+// Создаём бота через WebHook
 const bot = new TelegramBot(TOKEN, { webHook: true });
 
-// Webhook URL
+// Устанавливаем webhook URL
 bot.setWebHook(`${RENDER_URL}/webhook/${TOKEN}`);
 
-// Webhook обработчик
+// Webhook endpoint — Telegram отправляет сюда обновления
 app.post(`/webhook/${TOKEN}`, (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
@@ -25,27 +25,31 @@ app.get("/", (req, res) => {
   res.send("BOT OK");
 });
 
-// Лог канальных сообщений
+// WebApp endpoint — HTML плеер
+app.get("/webapp", (req, res) => {
+  res.sendFile("/opt/render/project/src/webapp.html");
+});
+
+// Ловим канальные посты (для определения channel_id)
 bot.on("channel_post", (msg) => {
   console.log("CHANNEL_POST:", msg.chat.id, msg.chat.title);
 });
 
-// команда /start
+// Команда /start
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(msg.chat.id, "Бот работает. Пришли ссылку на стрим.");
 });
 
-// обработка сообщений
+// Ловим ссылки
 bot.on("message", async (msg) => {
   const text = msg.text;
   if (!text || msg.chat.type === "channel") return;
 
-  // проверяем, это ли ссылка
   if (!(text.startsWith("http://") || text.startsWith("https://"))) return;
 
   const url = text.trim();
 
-  // определяем YouTube
+  // Проверяем YouTube
   const isYouTube =
     url.includes("youtube.com") ||
     url.includes("youtu.be");
@@ -53,41 +57,43 @@ bot.on("message", async (msg) => {
   let button;
 
   if (isYouTube) {
-    // YouTube — Telegram встроит плеер автоматически
+    // YouTube встроится нативно в Telegram
     button = {
       inline_keyboard: [
         [{ text: "🎥 Смотреть стрим", url: url }]
       ]
     };
   } else {
-    // другие платформы — WebView
-    const webview = `${RENDER_URL}/view?src=${encodeURIComponent(url)}`;
+    // Все другие платформы — WebApp страница
+    const webappUrl = `${RENDER_URL}/webapp?src=${encodeURIComponent(url)}`;
 
     button = {
       inline_keyboard: [
-        [{ text: "🎥 Смотреть стрим", url: webview }]
+        [{
+          text: "🎥 Смотреть стрим",
+          web_app: { url: webappUrl }
+        }]
       ]
     };
   }
 
   try {
-    // пост в канал
+    // публкуем пост в канале
     await bot.sendMessage(
       CHANNEL_ID,
       `🔴 Стрим сейчас!`,
       { reply_markup: button }
     );
 
-    // ответ стримеру
     await bot.sendMessage(msg.chat.id, "Опубликовано.");
   } catch (err) {
     await bot.sendMessage(
       msg.chat.id,
-      "Ошибка: я не могу отправить пост в канал. Проверь, что я админ."
+      "Ошибка: не могу отправить сообщение в канал. Проверь, что я админ."
     );
   }
 });
 
-// запуск сервера
+// Запуск сервера
 const PORT = process.env.PORT;
 app.listen(PORT, () => console.log("SERVER RUNNING", PORT));
