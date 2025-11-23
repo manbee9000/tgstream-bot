@@ -10,7 +10,7 @@ app.use(express.json());
 
 const DATA_FILE = "./data.json";
 
-// ===== Работа с файлом данных =====
+// ========== Работа с JSON-файлом ==========
 function loadDB() {
   try {
     return JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
@@ -25,24 +25,22 @@ function saveDB(db) {
 
 let DB = loadDB(); // структура: { [userId]: { channelId, donateName } }
 
-// ===== Инициализация бота с webhook =====
+// ========== Инициализация Telegram Webhook ==========
 const bot = new TelegramBot(TOKEN, { webHook: true });
 bot.setWebHook(`${RENDER_URL}/webhook/${TOKEN}`, {
   allowed_updates: ["message", "channel_post"]
 });
 
-// Webhook endpoint
 app.post(`/webhook/${TOKEN}`, (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
 });
 
-// Healthcheck
 app.get("/", (req, res) => {
   res.send("TGSTREAM BOT IS RUNNING");
 });
 
-// ===== /start =====
+// ========== /start ==========
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
@@ -55,7 +53,7 @@ bot.onText(/\/start/, (msg) => {
   );
 });
 
-// ===== /donate ИМЯ =====
+// ========== /donate ИМЯ ==========
 bot.onText(/\/donate (.+)/, (msg, match) => {
   const userId = msg.chat.id;
   const donateName = match[1].trim();
@@ -75,11 +73,11 @@ bot.onText(/\/donate (.+)/, (msg, match) => {
 
   bot.sendMessage(
     userId,
-    `🎉 Готово!\nТеперь донаты будут идти на:\nhttps://www.donationalerts.com/r/${donateName}`
+    `🎉 Готово!\nТеперь донаты будут идти сюда:\nhttps://www.donationalerts.com/r/${donateName}`
   );
 });
 
-// ===== /donate (без аргументов) — показать текущий =====
+// ========== /donate (проверить текущее имя) ==========
 bot.onText(/\/donate$/, (msg) => {
   const userId = msg.chat.id;
   const userData = DB[userId];
@@ -87,7 +85,7 @@ bot.onText(/\/donate$/, (msg) => {
   if (userData?.donateName) {
     bot.sendMessage(
       userId,
-      `💁‍♂️ Твой DonationAlerts сейчас:\nhttps://www.donationalerts.com/r/${userData.donateName}\n\nЧтобы изменить:\n/donate НОВОЕ_ИМЯ`
+      `💁 Твой DonationAlerts сейчас:\nhttps://www.donationalerts.com/r/${userData.donateName}\n\nЧтобы изменить:\n/donate НОВОЕ_ИМЯ`
     );
   } else {
     bot.sendMessage(
@@ -98,13 +96,13 @@ bot.onText(/\/donate$/, (msg) => {
   }
 });
 
-// ===== Обработка всех сообщений =====
+// ========== Основной обработчик сообщений ==========
 bot.on("message", async (msg) => {
   try {
     const chatId = msg.chat.id;
     const text = msg.text || "";
 
-    // 1) Если это пересланное сообщение из КАНАЛА — запоминаем канал
+    // ===== 1. Запоминаем канал, если переслано из channel =====
     if (
       msg.forward_from_chat &&
       msg.forward_from_chat.type === "channel" &&
@@ -118,14 +116,13 @@ bot.on("message", async (msg) => {
 
       await bot.sendMessage(
         chatId,
-        "✅ Я запомнил этот канал как твой.\nТеперь просто присылай мне ссылки на стрим — я буду постить туда."
+        "✅ Я запомнил этот канал как твой.\nТеперь просто присылай мне ссылки на стрим."
       );
       return;
     }
 
-    // 2) Остальное: работаем только с приватным чатом и ссылками
+    // ===== 2. Обрабатываем только ссылки в ЛС =====
     if (msg.chat.type !== "private") return;
-
     const trimmed = text.trim();
     if (!trimmed) return;
 
@@ -141,7 +138,7 @@ bot.on("message", async (msg) => {
         "❗ Я не знаю, в какой канал постить.\n\n" +
           "Сделай так:\n" +
           "1) Добавь меня админом в свой канал.\n" +
-          "2) Перешли мне ЛЮБОЕ сообщение из этого канала.\n" +
+          "2) Перешли мне ЛЮБОЕ сообщение из этого канала.\n\n" +
           "После этого снова пришли ссылку на стрим."
       );
       return;
@@ -152,57 +149,52 @@ bot.on("message", async (msg) => {
 
     const streamUrl = trimmed;
     const encodedStreamUrl = encodeURIComponent(streamUrl);
-
     const watchUrl = `${RENDER_URL}/webapp?src=${encodedStreamUrl}`;
 
-    const postText =
+    // ========== ПЕРВЫЙ ПОСТ (основной) ==========
+    const mainText =
       "🔴 Стрим сейчас!\n\n" +
       "🎥 Нажми «Смотреть стрим», чтобы открыть трансляцию.\n" +
-      "💬 Чат — в комментариях под этим постом.\n";
+      "💬 Чат — в комментариях под постом ниже.\n" +
+      "💸 Донаты с сообщением — через кнопку ниже.";
 
-    // Кнопки
     const inline_keyboard = [
       [
         {
           text: "🎬 Смотреть стрим",
           url: watchUrl
         }
+      ],
+      [
+        {
+          text: "💰 Сделать донат",
+          url: donateName
+            ? `https://www.donationalerts.com/r/${donateName}`
+            : "https://www.donationalerts.com/"
+        }
       ]
     ];
 
-    if (donateName) {
-      inline_keyboard.push([
-        {
-          text: "💰 Донат",
-          url: `https://www.donationalerts.com/r/${donateName}`
-        }
-      ]);
-    } else {
-      // если донат не настроен — можно подсказать
-      inline_keyboard.push([
-        {
-          text: "💰 Настроить донаты",
-          url: "https://www.donationalerts.com/"
-        }
-      ]);
-    }
-
-    // Публикуем пост в КАНАЛ
-    await bot.sendMessage(channelId, postText, {
+    // Публикуем основной пост
+    await bot.sendMessage(channelId, mainText, {
       reply_markup: { inline_keyboard }
     });
 
+    // ========== ВТОРОЙ ПОСТ (комментарии) ==========
+    await bot.sendMessage(channelId, "💬 Чат стрима");
+
+    // ========== Ответ стримеру ==========
     await bot.sendMessage(chatId, "✅ Стрим опубликован в твоём канале.");
 
   } catch (err) {
-    console.error("ERROR in message handler:", err);
+    console.error("ERROR:", err);
   }
 });
 
-// ===== WebApp со стримом (Twitch / YouTube / другие) =====
+// ========== WebApp для просмотра стрима ==========
 app.get("/webapp", (req, res) => {
   const streamUrl = req.query.src || "";
-  const PARENT_DOMAIN = "tgstream-bot.onrender.com"; // домен Render
+  const PARENT_DOMAIN = "tgstream-bot.onrender.com";
 
   res.send(`<!DOCTYPE html>
 <html>
@@ -211,86 +203,51 @@ app.get("/webapp", (req, res) => {
   <title>Stream Viewer</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
-    html, body {
-      margin: 0;
-      padding: 0;
-      height: 100%;
-      background: #000;
-      overflow: hidden;
-      font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
-    }
-    #player {
-      width: 100%;
-      height: 100%;
-      border: none;
-      background: #000;
-    }
-    #message {
-      color: #fff;
-      text-align: center;
-      margin-top: 40vh;
-      font-size: 18px;
-    }
+    html, body { margin:0; padding:0; height:100%; background:#000; }
+    #player { width:100%; height:100%; border:none; }
+    #msg { color:#fff; text-align:center; margin-top:40vh; font-size:18px; }
   </style>
 </head>
 <body>
-  <div id="message" style="display:none;"></div>
-  <iframe id="player" allowfullscreen></iframe>
+<div id="msg" style="display:none;"></div>
+<iframe id="player" allowfullscreen></iframe>
 
-  <script>
-    const rawSrc = ${JSON.stringify(streamUrl)};
-    const msgEl = document.getElementById('message');
-    const iframe = document.getElementById('player');
+<script>
+const raw = ${JSON.stringify(streamUrl)};
+const msg = document.getElementById("msg");
+const iframe = document.getElementById("player");
 
-    if (!rawSrc) {
-      msgEl.style.display = 'block';
-      msgEl.innerText = 'Нет ссылки на стрим';
-    } else {
-      try {
-        const src = decodeURIComponent(rawSrc);
-        let embedUrl = src;
+if (!raw) {
+  msg.style.display = "block";
+  msg.innerText = "Нет ссылки на стрим";
+} else {
+  try {
+    const src = decodeURIComponent(raw);
+    let final = src;
 
-        if (src.includes('twitch.tv')) {
-          try {
-            const u = new URL(src);
-            const parts = u.pathname.split('/').filter(Boolean);
-            const channel = parts[0] || '';
-            if (channel) {
-              embedUrl = 'https://player.twitch.tv/?channel='
-                + encodeURIComponent(channel)
-                + '&parent=${PARENT_DOMAIN}';
-            }
-          } catch (e) {
-            embedUrl = src;
-          }
-        } else if (src.includes('youtube.com') || src.includes('youtu.be')) {
-          let videoId = '';
-          if (src.includes('watch?v=')) {
-            const u = new URL(src);
-            videoId = u.searchParams.get('v') || '';
-          } else if (src.includes('youtu.be/')) {
-            const u = new URL(src);
-            const parts = u.pathname.split('/').filter(Boolean);
-            videoId = parts[0] || '';
-          }
-          if (videoId) {
-            embedUrl = 'https://www.youtube.com/embed/' + videoId;
-          }
-        }
-
-        iframe.src = embedUrl;
-      } catch (e) {
-        msgEl.style.display = 'block';
-        msgEl.innerText = 'Ошибка загрузки стрима';
+    if (src.includes("twitch.tv")) {
+      const u = new URL(src);
+      const parts = u.pathname.split("/").filter(Boolean);
+      const channel = parts[0] || "";
+      if (channel) {
+        final =
+          "https://player.twitch.tv/?channel=" +
+          encodeURIComponent(channel) +
+          "&parent=${PARENT_DOMAIN}";
       }
     }
-  </script>
+
+    iframe.src = final;
+  } catch (e) {
+    msg.style.display = "block";
+    msg.innerText = "Ошибка загрузки";
+  }
+}
+</script>
 </body>
 </html>`);
 });
 
-// ===== Запуск сервера =====
+// ========== Запуск ==========
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log("SERVER RUNNING", PORT);
-});
+app.listen(PORT, () => console.log("SERVER RUNNING", PORT));
