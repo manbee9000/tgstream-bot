@@ -1,5 +1,6 @@
 import express from "express";
 import TelegramBot from "node-telegram-bot-api";
+import axios from "axios";
 
 const TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
@@ -104,9 +105,45 @@ if (!rawUrl) {
 });
 
 // =======================
+// ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: превью
+// =======================
+function getPreviewUrl(streamUrl) {
+  try {
+    const url = new URL(streamUrl);
+    const host = url.hostname;
+
+    // Twitch: https://static-cdn.jtvnw.net/previews-ttv/live_user_<channel>-640x360.jpg
+    if (host.includes("twitch.tv")) {
+      const parts = url.pathname.split("/").filter(Boolean);
+      const channel = parts[0];
+      if (!channel) return null;
+      return `https://static-cdn.jtvnw.net/previews-ttv/live_user_${channel}-640x360.jpg`;
+    }
+
+    // YouTube: https://img.youtube.com/vi/<id>/maxresdefault.jpg
+    if (host.includes("youtube.com")) {
+      const id = url.searchParams.get("v");
+      if (!id) return null;
+      return `https://img.youtube.com/vi/${id}/maxresdefault.jpg`;
+    }
+
+    if (host === "youtu.be") {
+      const parts = url.pathname.split("/").filter(Boolean);
+      const id = parts[0];
+      if (!id) return null;
+      return `https://img.youtube.com/vi/${id}/maxresdefault.jpg`;
+    }
+
+    // Остальные пока без превью
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// =======================
 // Команды /start, /donate
 // =======================
-
 let donateMap = {}; 
 
 bot.onText(/\/start/, (msg) => {
@@ -118,7 +155,6 @@ bot.onText(/\/start/, (msg) => {
 
 bot.onText(/\/donate (.+)/, async (msg, match) => {
   donateMap[msg.chat.id] = match[1].trim();
-
   await bot.sendMessage(
     msg.chat.id,
     `Донаты настроены: https://www.donationalerts.com/r/${match[1].trim()}`
@@ -128,45 +164,62 @@ bot.onText(/\/donate (.+)/, async (msg, match) => {
 // =======================
 // ПРИЁМ ССЫЛКИ НА СТРИМ
 // =======================
-
 bot.on("message", async (msg) => {
   const text = msg.text;
-
   if (!text) return;
   if (msg.chat.type === "channel") return;
 
+  // Ссылка?
   if (text.startsWith("http://") || text.startsWith("https://")) {
-
     const donateUser = donateMap[msg.chat.id] || null;
 
     const webappUrl =
-      `${RENDER_URL}/webapp?src=` +
-      encodeURIComponent(text);
+      `${RENDER_URL}/webapp?src=` + encodeURIComponent(text);
 
-    // ключевое отличие: ТОЛЬКО url кнопки
-    let keyboard = [
+    const keyboard = [
       [{ text: "🎥 Смотреть стрим", url: webappUrl }]
     ];
 
     if (donateUser) {
       keyboard.push([
-        { text: "💸 Сделать донат", url: `https://www.donationalerts.com/r/${donateUser}` }
+        {
+          text: "💸 Сделать донат",
+          url: `https://www.donationalerts.com/r/${donateUser}`
+        }
       ]);
     }
 
+    const caption =
+      "🔴 Не пропустите стрим!\n\n" +
+      "🎥 Нажмите «Смотреть стрим», чтобы открыть трансляцию.\n" +
+      "💬 Чат — в комментариях под постом ниже.\n" +
+      "💸 Донат — через кнопку ниже.\n\n" +
+      "📸 Картинка со стрима — автоматически полученная Twitch/YouTube.";
+
+    const previewUrl = getPreviewUrl(text);
+
     try {
-      // 1 пост — основной
-      await bot.sendMessage(
-        CHANNEL_ID,
-        "🔴 Стрим сейчас!\n\n🎥 Нажми «Смотреть стрим», чтобы открыть трансляцию.\n💬 Чат — в комментариях под постом ниже.\n💸 Донаты — через кнопку ниже.",
-        {
+      // Если можем достать превью — шлём фото + подпись
+      if (previewUrl) {
+        const resp = await axios.get(previewUrl, { responseType: "arraybuffer" });
+        const buffer = Buffer.from(resp.data);
+
+        await bot.sendPhoto(CHANNEL_ID, buffer, {
+          caption,
           reply_markup: {
             inline_keyboard: keyboard
           }
-        }
-      );
+        });
+      } else {
+        // Если превью не нашли — шлём просто текст
+        await bot.sendMessage(CHANNEL_ID, caption, {
+          reply_markup: {
+            inline_keyboard: keyboard
+          }
+        });
+      }
 
-      // 2 пост — чат
+      // Второй пост — чат
       await bot.sendMessage(CHANNEL_ID, "💬 Чат стрима");
 
       await bot.sendMessage(msg.chat.id, "Опубликовано.");
