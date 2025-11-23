@@ -6,14 +6,14 @@ const TOKEN = process.env.BOT_TOKEN;
 const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
 const PORT = process.env.PORT || 10000;
 
-// Память донатов
-const donateNames = {};
-
 const app = express();
 app.use(express.json());
 
 const bot = new TelegramBot(TOKEN, { webHook: true });
 bot.setWebHook(`${RENDER_URL}/webhook/${TOKEN}`);
+
+// Хранилище настроек стримера
+const streamerConfig = {}; // { userId: { channelId, donateName } }
 
 // ---------------- WEBHOOK ----------------
 app.post(`/webhook/${TOKEN}`, (req, res) => {
@@ -36,35 +36,26 @@ app.get("/webapp", (req, res) => {
 });
 
 // ============ UTILS: THUMBNAILS ==========
-
-// Получаем превью Twitch канала
 async function getTwitchThumbnail(url) {
   const name = url.split("/").pop();
   return `https://static-cdn.jtvnw.net/previews-ttv/live_user_${name}-1280x720.jpg`;
 }
 
-// Получаем превью YouTube стрима
 async function getYouTubeThumbnail(url) {
   let id = null;
-
   if (url.includes("watch?v=")) id = url.split("v=")[1].split("&")[0];
   if (url.includes("youtu.be/")) id = url.split("youtu.be/")[1].split("?")[0];
-
   return id ? `https://i.ytimg.com/vi/${id}/maxresdefault.jpg` : null;
 }
 
-// Определяем превью автоматически
 async function getThumbnail(url) {
   if (url.includes("twitch.tv")) return getTwitchThumbnail(url);
   if (url.includes("youtu")) return getYouTubeThumbnail(url);
-  return null; // для VK превью не используем
+  return null;
 }
 
 // ============= SEND STREAM POSTS =========
-
-// Публикация
 async function publishStreamPost(channelId, streamUrl, thumbnail, donateName) {
-  // 1 — пост со стримом
   let inline_keyboard = [
     [
       {
@@ -74,7 +65,6 @@ async function publishStreamPost(channelId, streamUrl, thumbnail, donateName) {
     ]
   ];
 
-  // Добавляем кнопку доната
   if (donateName) {
     inline_keyboard.push([
       {
@@ -84,13 +74,12 @@ async function publishStreamPost(channelId, streamUrl, thumbnail, donateName) {
     ]);
   }
 
-  let messageText =
+  const messageText =
     "🔴 Не пропустите стрим!\n\n" +
-    "🎥 Нажмите «Смотреть стрим», чтобы открыть трансляцию.\n" +
+    "🎥 Нажмите «Смотреть стрим».\n" +
     "💬 Чат — в комментариях под постом ниже.\n" +
     "💸 Донат — через кнопку ниже.";
 
-  // Если есть картинка — отправляем как фото
   if (thumbnail) {
     await bot.sendPhoto(channelId, thumbnail, {
       caption: messageText,
@@ -102,56 +91,91 @@ async function publishStreamPost(channelId, streamUrl, thumbnail, donateName) {
     });
   }
 
-  // 2 — создаём пост для комментариев
   await bot.sendMessage(channelId, "💬 Чат стрима");
 }
 
-// =============== BOT HANDLERS ==============
+// =============== COMMANDS =================
 
-// /donate xxxx
+// /setchannel @name
+bot.onText(/\/setchannel (.+)/, async (msg, match) => {
+  const userId = msg.from.id;
+  let channel = match[1].trim();
+
+  // Если юзер указал "@test" — нужно получить ID канала
+  if (channel.startsWith("@")) {
+    try {
+      const chat = await bot.getChat(channel);
+      channel = chat.id;
+    } catch {
+      return bot.sendMessage(msg.chat.id, "Не смог найти канал. Проверь @username.");
+    }
+  }
+
+  streamerConfig[userId] = streamerConfig[userId] || {};
+  streamerConfig[userId].channelId = Number(channel);
+
+  bot.sendMessage(msg.chat.id, `Готово! Посты теперь будут публиковаться в канал: ${channel}`);
+});
+
+// /donate имя
 bot.onText(/\/donate (.+)/, (msg, match) => {
+  const userId = msg.from.id;
   const name = match[1].trim();
-  donateNames[msg.chat.id] = name;
 
+  streamerConfig[userId] = streamerConfig[userId] || {};
+  streamerConfig[userId].donateName = name;
+
+  bot.sendMessage(msg.chat.id, `Донат подключён:\nhttps://www.donationalerts.com/r/${name}`);
+});
+
+// /start
+bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    `Готово! Донат-страница настроена:\nhttps://www.donationalerts.com/r/${name}`
+    "Привет! Перед стримом выполни настройки:\n\n" +
+      "1️⃣ Укажи свой канал:\n/setchannel @имя_канала\n\n" +
+      "2️⃣ (Необязательно) Укажи донат:\n/donate имя\n\n" +
+      "После этого просто отправляй ссылку на стрим!"
   );
 });
 
-// Простая проверка
-bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, "Отправь мне ссылку на стрим.");
-});
+// ------------ STREAM LINK HANDLER ----------
 
-// ОБРАБОТКА ЛЮБОГО СООБЩЕНИЯ
 bot.on("message", async (msg) => {
   const text = msg.text;
   if (!text) return;
-
-  // обрабатываем ссылки только в ЛИЧКЕ
   if (msg.chat.type !== "private") return;
 
+  // команды не трогаем
+  if (text.startsWith("/")) return;
+
+  // должна быть ссылка
   if (!text.startsWith("http://") && !text.startsWith("https://")) return;
 
+  const userId = msg.from.id;
+  const cfg = streamerConfig[userId];
+
+  if (!cfg || !cfg.channelId) {
+    return bot.sendMessage(
+      msg.chat.id,
+      "Сначала настрой канал:\n/setchannel @имя_канала"
+    );
+  }
+
   const streamUrl = text.trim();
-  const channelId = msg.from.id; // Стример = владелец канала (персонально)
 
   try {
-    const thumbnail = await getThumbnail(streamUrl);
-    const donateName = donateNames[channelId] || null;
+    const thumb = await getThumbnail(streamUrl);
+    const donateName = cfg.donateName || null;
 
-    await publishStreamPost(channelId, streamUrl, thumbnail, donateName);
+    await publishStreamPost(cfg.channelId, streamUrl, thumb, donateName);
 
-    await bot.sendMessage(msg.chat.id, "Опубликовано!");
+    bot.sendMessage(msg.chat.id, "Готово! Пост опубликован в твоём канале.");
   } catch (err) {
-    console.error("ERROR:", err);
-    await bot.sendMessage(
-      msg.chat.id,
-      "Ошибка: я не могу отправить пост. Проверь, что я админ в канале."
-    );
+    console.error("STREAM POST ERROR:", err);
+    bot.sendMessage(msg.chat.id, "Ошибка. Проверь, что я админ в твоём канале.");
   }
 });
 
-// ---------------- START SERVER ----------------
+// ---------------- SERVER ----------------
 app.listen(PORT, () => console.log("SERVER RUNNING", PORT));
