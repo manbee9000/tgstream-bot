@@ -6,18 +6,17 @@ const TOKEN = process.env.BOT_TOKEN;
 const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
 const PORT = process.env.PORT || 10000;
 
-// домен для Twitch embed (parent=)
-// например из https://tgstream-bot.onrender.com возьмём tgstream-bot.onrender.com
+// вычисляем parent-домен
 let PARENT_DOMAIN = "localhost";
 try {
   if (RENDER_URL) {
     PARENT_DOMAIN = new URL(RENDER_URL).host;
   }
 } catch (e) {
-  console.error("Cannot parse RENDER_URL, fallback parent domain:", e);
+  console.error("Cannot parse RENDER_URL:", e);
 }
 
-// =============================
+// ========================================
 const app = express();
 app.use(express.json());
 
@@ -30,20 +29,15 @@ if (!RENDER_URL) {
   console.error("RENDER_EXTERNAL_URL is not set!");
 }
 
+// Telegram Webhook
 const bot = new TelegramBot(TOKEN, { webHook: true });
 bot.setWebHook(`${RENDER_URL}/webhook/${TOKEN}`);
 
-// Хранилище настроек стримеров
-// streamerConfig[userId] = { channelId, donateName }
-const streamerConfig = {};
+const streamerConfig = {}; // { userId: { channelId, donateName } }
 
-// ========== WEBHOOK ==========
-app.post(`/webhook/${TOKEN}`, (req, res) => {
-  bot.processUpdate(req.body);
-  res.sendStatus(200);
-});
-
-// ========== WEBAPP PAGE ==========
+// =====================================================
+// WEBAPP — iframe wrapper
+// =====================================================
 app.get("/webapp", (req, res) => {
   const src = (req.query.src || "").toString();
   res.send(`
@@ -64,85 +58,115 @@ app.get("/webapp", (req, res) => {
   `);
 });
 
-// ========== HELPERS: YOUTUBE ID / EMBED / THUMBS ==========
+// =====================================================
+// Platform Helpers
+// =====================================================
+
+// ===== YouTube ID extract =====
 function extractYouTubeId(url) {
   let id = null;
   try {
-    if (url.includes("watch?v=")) {
-      id = url.split("v=")[1].split("&")[0];
-    } else if (url.includes("youtu.be/")) {
-      id = url.split("youtu.be/")[1].split("?")[0];
-    }
-  } catch (e) {
-    id = null;
-  }
-  return id || null;
+    if (url.includes("watch?v=")) id = url.split("v=")[1].split("&")[0];
+    else if (url.includes("youtu.be/")) id = url.split("youtu.be/")[1].split("?")[0];
+  } catch {}
+  return id;
 }
 
+// ===== Twitch Thumbnail =====
 async function getTwitchThumbnail(url) {
   try {
-    let name = url.split("/").pop() || "";
-    if (!name) return null;
-    name = name.split("?")[0];
+    let name = url.split("/").pop().split("?")[0];
     return `https://static-cdn.jtvnw.net/previews-ttv/live_user_${name}-1280x720.jpg`;
   } catch {
     return null;
   }
 }
 
+// ===== YouTube Thumbnail =====
 async function getYouTubeThumbnail(url) {
+  const id = extractYouTubeId(url);
+  if (!id) return null;
+
+  // HD сначала
+  const hd = `https://i.ytimg.com/vi/${id}/maxresdefault.jpg`;
+  // fallback
+  const hq = `https://i.ytimg.com/vi/${id}/hqdefault.jpg`;
+
+  return hd || hq;
+}
+
+// ===== VK Thumbnail =====
+// vk.com/video-123_456 → embed: https://vk.com/video_ext.php?oid=-123&id=456
+async function getVkThumbnail(url) {
   try {
-    const id = extractYouTubeId(url);
-    if (!id) return null;
-    return `https://i.ytimg.com/vi/${id}/maxresdefault.jpg`;
+    const parts = url.split("video")[1]; // "-123_456"
+    const [oid, id] = parts.split("_");
+    // VK не даёт thumbnail API без токена → используем стандартный превью,
+    // Telegram сам создаст маленький preview.
+    return null;
   } catch {
     return null;
   }
 }
 
+// =====================================================
+// Embed URL builder
+// =====================================================
+function getEmbedUrl(url) {
+  // Twitch
+  if (url.includes("twitch.tv")) {
+    try {
+      const end = url.split("/").pop().split("?")[0];
+      return `https://player.twitch.tv/?channel=${encodeURIComponent(
+        end
+      )}&parent=${encodeURIComponent(PARENT_DOMAIN)}`;
+    } catch {
+      return url;
+    }
+  }
+
+  // YouTube
+  if (url.includes("youtu")) {
+    const id = extractYouTubeId(url);
+    if (id) {
+      return `https://www.youtube-nocookie.com/embed/${id}?autoplay=1`;
+    }
+  }
+
+  // VK video
+  if (url.includes("vk.com/video")) {
+    try {
+      const raw = url.split("video")[1]; // -123_456
+      const [oid, id] = raw.split("_");
+
+      return `https://vk.com/video_ext.php?oid=${oid}&id=${id}&hd=1`;
+    } catch {
+      return url;
+    }
+  }
+
+  return url;
+}
+
+// =====================================================
+// Thumbnail selector
+// =====================================================
 async function getThumbnail(url) {
   if (url.includes("twitch.tv")) return getTwitchThumbnail(url);
   if (url.includes("youtu")) return getYouTubeThumbnail(url);
+  if (url.includes("vk.com/video")) return getVkThumbnail(url);
   return null;
 }
 
-// ========== EMBED URL ДЛЯ IFRAME ==========
-function getEmbedUrl(rawUrl) {
-  // Twitch: https://www.twitch.tv/CHANNEL -> player.twitch.tv
-  if (rawUrl.includes("twitch.tv")) {
-    try {
-      const parts = rawUrl.split("/");
-      let name = parts.pop() || parts.pop() || ""; // на случай трейлинга /
-      name = name.split("?")[0];
-      if (!name) return rawUrl;
-
-      return `https://player.twitch.tv/?channel=${encodeURIComponent(
-        name
-      )}&parent=${encodeURIComponent(PARENT_DOMAIN)}`;
-    } catch {
-      return rawUrl;
-    }
-  }
-
-  // YouTube: обычные ссылки -> embed
-  if (rawUrl.includes("youtu")) {
-    const id = extractYouTubeId(rawUrl);
-    if (id) {
-      return `https://www.youtube.com/embed/${id}?autoplay=1`;
-    }
-  }
-
-  // по умолчанию — как есть
-  return rawUrl;
-}
-
-// ========== ОТПРАВКА ПОСТОВ СО СТРИМОМ ==========
-async function publishStreamPost(channelId, streamUrlForEmbed, thumbnail, donateName) {
+// =====================================================
+// Publish Stream Post
+// =====================================================
+async function publishStreamPost(channelId, embedUrl, thumbnail, donateName) {
   const buttons = [
     [
       {
         text: "🎥 Смотреть стрим",
-        url: `${RENDER_URL}/webapp?src=${encodeURIComponent(streamUrlForEmbed)}`
+        url: `${RENDER_URL}/webapp?src=${encodeURIComponent(embedUrl)}`
       }
     ]
   ];
@@ -176,9 +200,11 @@ async function publishStreamPost(channelId, streamUrlForEmbed, thumbnail, donate
   await bot.sendMessage(channelId, "💬 Чат стрима");
 }
 
-// ========== COMMANDS ==========
+// =====================================================
+// Commands
+// =====================================================
 
-// /donate name
+// /donate
 bot.onText(/\/donate (.+)/, (msg, match) => {
   const userId = msg.from.id;
   const name = match[1].trim();
@@ -204,13 +230,15 @@ bot.onText(/\/start/, (msg) => {
   );
 });
 
-// ========== UNIVERSAL MESSAGE HANDLER ==========
+// =====================================================
+// Universal Message Handler
+// =====================================================
 bot.on("message", async (msg) => {
   try {
     const text = msg.text || "";
     const userId = msg.from.id;
 
-    // 1) Подключение канала через пересланное сообщение
+    // подключение канала
     if (msg.forward_from_chat && msg.forward_from_chat.type === "channel") {
       const channelId = msg.forward_from_chat.id;
 
@@ -223,11 +251,9 @@ bot.on("message", async (msg) => {
       );
     }
 
-    // команды обрабатываются отдельно
     if (text.startsWith("/")) return;
-
-    // 2) Нас интересуют только ссылки в личке
     if (msg.chat.type !== "private") return;
+
     if (!text.startsWith("http://") && !text.startsWith("https://")) return;
 
     const cfg = streamerConfig[userId];
@@ -238,23 +264,16 @@ bot.on("message", async (msg) => {
       );
     }
 
-    const originalUrl = text.trim();
-    const embedUrl = getEmbedUrl(originalUrl);
-    const thumb = await getThumbnail(originalUrl);
+    const embedUrl = getEmbedUrl(text);
+    const thumb = await getThumbnail(text);
 
     await publishStreamPost(cfg.channelId, embedUrl, thumb, cfg.donateName);
 
     bot.sendMessage(msg.chat.id, "Готово! Пост опубликован в твоём канале.");
   } catch (err) {
     console.error("MESSAGE ERROR", err);
-    try {
-      await bot.sendMessage(
-        msg.chat.id,
-        "Произошла ошибка при обработке сообщения. Попробуй ещё раз чуть позже."
-      );
-    } catch {}
   }
 });
 
-// ========== SERVER ==========
-app.listen(PORT, () => console.log("SERVER RUNNING ON PORT", PORT));
+// =====================================================
+app.listen(PORT, () => console.log("SERVER RUNNING:", PORT));
