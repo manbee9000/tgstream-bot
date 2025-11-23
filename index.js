@@ -4,93 +4,79 @@ import axios from "axios";
 
 const TOKEN = process.env.BOT_TOKEN;
 const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
+const PORT = process.env.PORT || 10000;
 
-const bot = new TelegramBot(TOKEN, { webHook: true });
-bot.setWebHook(`${RENDER_URL}/webhook/${TOKEN}`);
+// Память донатов
+const donateNames = {};
 
 const app = express();
 app.use(express.json());
 
+const bot = new TelegramBot(TOKEN, { webHook: true });
+bot.setWebHook(`${RENDER_URL}/webhook/${TOKEN}`);
+
+// ---------------- WEBHOOK ----------------
 app.post(`/webhook/${TOKEN}`, (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
 });
 
-app.get("/", (req, res) => res.send("BOT OK"));
+app.get("/", (_, res) => res.send("BOT OK"));
 
-// WebApp endpoint (iframe player)
+// --------------- WEBAPP PAGE -------------
 app.get("/webapp", (req, res) => {
   const src = req.query.src || "";
   res.send(`
     <html>
-      <body style="margin:0;padding:0;background:#000;height:100vh;display:flex;align-items:center;justify-content:center;">
-        <iframe 
-          src="${src}"
-          style="border:0;width:100%;height:100%;"
-          allowfullscreen
-          allow="autoplay"
-        ></iframe>
+      <body style="margin:0;background:#000;display:flex;align-items:center;justify-content:center;">
+        <iframe src="${src}" allowfullscreen style="width:100%;height:100%;border:0;"></iframe>
       </body>
     </html>
   `);
 });
 
-// ============================
-// Донаты (имя DonationAlerts)
-// ============================
-const donateNames = {};
+// ============ UTILS: THUMBNAILS ==========
 
-bot.onText(/\/donate (.+)/, (msg, match) => {
-  const donateName = match[1].trim();
-  donateNames[msg.chat.id] = donateName;
-
-  bot.sendMessage(msg.chat.id, `Донаты настроены: https://www.donationalerts.com/r/${donateName}`);
-});
-
-// ============================
-// Получение превью стрима
-// ============================
-async function getThumbnail(url) {
-  if (url.includes("twitch.tv")) {
-    return "https://static-cdn.jtvnw.net/ttv-static/404_preview-640x360.jpg";
-  }
-
-  if (url.includes("youtube.com") || url.includes("youtu.be")) {
-    const id = url.match(/v=([^&]+)/)?.[1] || url.split("/").pop();
-    return `https://img.youtube.com/vi/${id}/maxresdefault.jpg`;
-  }
-
-  if (url.includes("vk.com")) {
-    return "https://vk.com/images/camera_200.png";
-  }
-
-  return "https://via.placeholder.com/640x360?text=Stream";
+// Получаем превью Twitch канала
+async function getTwitchThumbnail(url) {
+  const name = url.split("/").pop();
+  return `https://static-cdn.jtvnw.net/previews-ttv/live_user_${name}-1280x720.jpg`;
 }
 
-// ============================
-// Публикация двух постов
-// ============================
-const WEBAPP_URL = `${RENDER_URL}/webapp`;
+// Получаем превью YouTube стрима
+async function getYouTubeThumbnail(url) {
+  let id = null;
 
-async function publishStreamPost(chatId, streamUrl, thumbnailUrl, donateName) {
-  const text =
-`🔴 Не пропустите стрим!
+  if (url.includes("watch?v=")) id = url.split("v=")[1].split("&")[0];
+  if (url.includes("youtu.be/")) id = url.split("youtu.be/")[1].split("?")[0];
 
-🎥 Нажмите «Смотреть стрим», чтобы открыть трансляцию.
-💬 Чат — в комментариях под постом ниже.
-💸 Донат — через кнопку ниже.`;
+  return id ? `https://i.ytimg.com/vi/${id}/maxresdefault.jpg` : null;
+}
 
-  const buttons = [
+// Определяем превью автоматически
+async function getThumbnail(url) {
+  if (url.includes("twitch.tv")) return getTwitchThumbnail(url);
+  if (url.includes("youtu")) return getYouTubeThumbnail(url);
+  return null; // для VK превью не используем
+}
+
+// ============= SEND STREAM POSTS =========
+
+// Публикация
+async function publishStreamPost(channelId, streamUrl, thumbnail, donateName) {
+  // 1 — пост со стримом
+  let inline_keyboard = [
     [
       {
         text: "🎥 Смотреть стрим",
-        web_app: { url: `${WEBAPP_URL}?src=${encodeURIComponent(streamUrl)}` }
+        web_app: { url: `${RENDER_URL}/webapp?src=${encodeURIComponent(streamUrl)}` }
       }
     ]
   ];
 
+  // Добавляем кнопку доната
   if (donateName) {
-    buttons.push([
+    inline_keyboard.push([
       {
         text: "💸 Донат",
         url: `https://www.donationalerts.com/r/${donateName}`
@@ -98,48 +84,74 @@ async function publishStreamPost(chatId, streamUrl, thumbnailUrl, donateName) {
     ]);
   }
 
-  // 1️⃣ пост с картинкой
-  const msg1 = await bot.sendPhoto(chatId, thumbnailUrl, {
-    caption: text,
-    reply_markup: { inline_keyboard: buttons }
-  });
+  let messageText =
+    "🔴 Не пропустите стрим!\n\n" +
+    "🎥 Нажмите «Смотреть стрим», чтобы открыть трансляцию.\n" +
+    "💬 Чат — в комментариях под постом ниже.\n" +
+    "💸 Донат — через кнопку ниже.";
 
-  // 2️⃣ пост для комментариев
-  await bot.sendMessage(chatId, "💬 Чат стрима", {
-    reply_to_message_id: msg1.message_id
-  });
+  // Если есть картинка — отправляем как фото
+  if (thumbnail) {
+    await bot.sendPhoto(channelId, thumbnail, {
+      caption: messageText,
+      reply_markup: { inline_keyboard }
+    });
+  } else {
+    await bot.sendMessage(channelId, messageText, {
+      reply_markup: { inline_keyboard }
+    });
+  }
+
+  // 2 — создаём пост для комментариев
+  await bot.sendMessage(channelId, "💬 Чат стрима");
 }
 
-// ============================
-// Основной обработчик URL
-// ============================
+// =============== BOT HANDLERS ==============
+
+// /donate xxxx
+bot.onText(/\/donate (.+)/, (msg, match) => {
+  const name = match[1].trim();
+  donateNames[msg.chat.id] = name;
+
+  bot.sendMessage(
+    msg.chat.id,
+    `Готово! Донат-страница настроена:\nhttps://www.donationalerts.com/r/${name}`
+  );
+});
+
+// Простая проверка
+bot.onText(/\/start/, (msg) => {
+  bot.sendMessage(msg.chat.id, "Отправь мне ссылку на стрим.");
+});
+
+// ОБРАБОТКА ЛЮБОГО СООБЩЕНИЯ
 bot.on("message", async (msg) => {
-  if (!msg.text) return;
-  if (msg.chat.type === "private" && msg.text.startsWith("http")) {
-    const streamUrl = msg.text.trim();
-    const chatId = msg.chat.id;
+  const text = msg.text;
+  if (!text) return;
 
-    // проверяем, что бот админ в канале
-    try {
-      const canPost = await bot.getChatMember(chatId, (await bot.getMe()).id);
-      if (!["administrator", "creator"].includes(canPost.status)) {
-        await bot.sendMessage(chatId, "Ошибка: я не админ в канале.");
-        return;
-      }
-    } catch (err) {}
+  // обрабатываем ссылки только в ЛИЧКЕ
+  if (msg.chat.type !== "private") return;
 
-    try {
-      const thumbnail = await getThumbnail(streamUrl);
-      const donate = donateNames[chatId] || null;
+  if (!text.startsWith("http://") && !text.startsWith("https://")) return;
 
-      await publishStreamPost(chatId, streamUrl, thumbnail, donate);
+  const streamUrl = text.trim();
+  const channelId = msg.from.id; // Стример = владелец канала (персонально)
 
-      await bot.sendMessage(chatId, "Опубликовано!");
-    } catch (e) {
-      await bot.sendMessage(chatId, "Ошибка публикации. Проверь, что я админ.");
-    }
+  try {
+    const thumbnail = await getThumbnail(streamUrl);
+    const donateName = donateNames[channelId] || null;
+
+    await publishStreamPost(channelId, streamUrl, thumbnail, donateName);
+
+    await bot.sendMessage(msg.chat.id, "Опубликовано!");
+  } catch (err) {
+    console.error("ERROR:", err);
+    await bot.sendMessage(
+      msg.chat.id,
+      "Ошибка: я не могу отправить пост. Проверь, что я админ в канале."
+    );
   }
 });
 
-const PORT = process.env.PORT || 10000;
+// ---------------- START SERVER ----------------
 app.listen(PORT, () => console.log("SERVER RUNNING", PORT));
