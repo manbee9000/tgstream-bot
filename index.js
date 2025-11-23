@@ -4,147 +4,195 @@ import TelegramBot from "node-telegram-bot-api";
 
 const TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
-const PUBLIC_URL = process.env.RENDER_EXTERNAL_URL;
+const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
 
 const app = express();
 app.use(express.json());
 
-// Webhook bot
-const bot = new TelegramBot(TOKEN, { webHook: true });
-bot.setWebHook(`${PUBLIC_URL}/webhook/${TOKEN}`);
+// ----------------------
+//  Загрузка data.json
+// ----------------------
+const DATA_FILE = "./data.json";
 
-// Загрузка донат-ссылок
-let donateLinks = {};
-try {
-  if (fs.existsSync("data.json")) {
-    donateLinks = JSON.parse(fs.readFileSync("data.json"));
+function loadData() {
+  try {
+    return JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+  } catch (e) {
+    return {};
   }
-} catch (e) {
-  console.error("Ошибка чтения data.json", e);
 }
 
-// Функция сохранения в файл
-function saveDonateLinks() {
-  fs.writeFileSync("data.json", JSON.stringify(donateLinks, null, 2));
+function saveData(data) {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf8");
 }
 
-// Webhook endpoint
+let DB = loadData();
+
+// ----------------------
+//  Инициализация бота
+// ----------------------
+const bot = new TelegramBot(TOKEN, { webHook: true });
+
+bot.setWebHook(`${RENDER_URL}/webhook/${TOKEN}`, {
+  allowed_updates: ["message", "channel_post"]
+});
+
+// ----------------------
+//  Webhook endpoint
+// ----------------------
 app.post(`/webhook/${TOKEN}`, (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
 });
 
-// Health check
-app.get("/", (req, res) => res.send("BOT ONLINE OK"));
-
-// ====== ОБРАБОТКА КОМАНД ======
-
-// /start
-bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(
-    msg.chat.id,
-    "Привет! Отправь ссылку на стрим, и я опубликую её в канале.\n\n" +
-      "Для настройки DonationAlerts используй:\n" +
-      "`/donate https://donationalerts.com/r/имя`",
-    { parse_mode: "Markdown" }
-  );
+// ----------------------
+//  Основной маршрут
+// ----------------------
+app.get("/", (req, res) => {
+  res.send("TGSTREAM BOT WORKING");
 });
 
-// /donate <url>
+// =======================================================
+//  Команда /donate username
+// =======================================================
 bot.onText(/\/donate (.+)/, (msg, match) => {
-  const userId = msg.from.id;
-  const url = match[1].trim();
+  const userId = msg.chat.id;
+  const username = match[1].trim();
 
-  if (!url.startsWith("http")) {
-    bot.sendMessage(msg.chat.id, "Некорректная ссылка.");
+  if (!username) {
+    bot.sendMessage(userId, "❗ Укажи имя DonationAlerts\nПример: `/donate myname`", {
+      parse_mode: "Markdown"
+    });
     return;
   }
 
-  donateLinks[userId] = url;
-  saveDonateLinks();
+  if (!DB[userId]) DB[userId] = {};
+  DB[userId].donate = username;
+  saveData(DB);
 
-  bot.sendMessage(msg.chat.id, "Ссылка DonationAlerts сохранена!");
+  bot.sendMessage(
+    userId,
+    `🎉 Готово!\nТеперь твоя кнопка доната ведёт на:\nhttps://www.donationalerts.com/r/${username}`
+  );
 });
 
-// ====== ОБРАБОТКА ЛЮБОГО СООБЩЕНИЯ СО ССЫЛКОЙ ======
-bot.on("message", async (msg) => {
-  try {
-    console.log("INCOMING:", msg.text);
+// =======================================================
+//  Команда /donate (без параметров) — показать текущие
+// =======================================================
+bot.onText(/\/donate$/, (msg) => {
+  const userId = msg.chat.id;
 
-    // пропускаем канал
-    if (msg.chat.type === "channel") return;
-
-    const text = msg.text?.trim();
-    if (!text) return;
-
-    // ссылка?
-    if (!(text.startsWith("http://") || text.startsWith("https://"))) return;
-
-    const userId = msg.from.id;
-    const streamUrl = encodeURIComponent(text);
-
-    // ссылка DonationAlerts?
-    const donateUrl = donateLinks[userId]
-      ? donateLinks[userId]
-      : "https://donationalerts.com";
-
-    const watchUrl = `${PUBLIC_URL}/webapp?src=${streamUrl}`;
-
-    // КНОПКИ
-    const buttons = {
-      inline_keyboard: [
-        [
-          {
-            text: "🎥 Смотреть стрим",
-            web_app: { url: watchUrl }
-          }
-        ],
-        [
-          {
-            text: "💰 Donat",
-            url: donateUrl
-          }
-        ]
-      ]
-    };
-
-    // Постим в канал
-    await bot.sendMessage(CHANNEL_ID, "🔴 Стрим сейчас!", {
-      reply_markup: buttons
-    });
-
-    bot.sendMessage(msg.chat.id, "Готово! Стрим опубликован.");
-
-  } catch (err) {
-    console.error("ERROR:", err);
+  if (DB[userId]?.donate) {
     bot.sendMessage(
-      msg.chat.id,
-      "Ошибка: не могу отправить сообщение в канал. Проверь, что я админ."
+      userId,
+      `💁‍♂️ Твой DonationAlerts: https://www.donationalerts.com/r/${DB[userId].donate}\n\nЧтобы изменить: /donate ИМЯ`
+    );
+  } else {
+    bot.sendMessage(
+      userId,
+      "Ты пока не настроил донаты.\nОтправь:\n`/donate ИМЯ_НА_DA`",
+      { parse_mode: "Markdown" }
     );
   }
 });
 
-// ====== WEBAPP ======
-app.get("/webapp", (req, res) => {
-  const src = req.query.src;
-  if (!src) {
-    return res.send("<h2>Ссылка не передана</h2>");
+// =======================================================
+//  Команда /start
+// =======================================================
+bot.onText(/\/start/, (msg) => {
+  bot.sendMessage(
+    msg.chat.id,
+    "👋 Привет! Отправь мне ссылку на стрим.\n\n" +
+      "Я опубликую её в твоём канале с кнопками:\n🎥 Смотреть стрим\n💰 Донат\n\n" +
+      "Чтобы настроить донаты:\n/donate ИМЯ"
+  );
+});
+
+// =======================================================
+//  Обработка ссылок
+// =======================================================
+bot.on("message", async (msg) => {
+  const chatId = msg.chat.id;
+  const text = msg.text;
+
+  if (!text || msg.chat.type === "channel") return;
+
+  // проверка ссылки
+  const isUrl = text.startsWith("http://") || text.startsWith("https://");
+  if (!isUrl) return;
+
+  const streamUrl = text.trim();
+  const encoded = encodeURIComponent(streamUrl);
+
+  const donateName = DB[chatId]?.donate;
+  const donateUrl = donateName
+    ? `https://www.donationalerts.com/r/${donateName}`
+    : null;
+
+  // Кнопки
+  const buttons = [
+    [
+      {
+        text: "🎬 Смотреть стрим",
+        url: `${RENDER_URL}/webapp?src=${encoded}`
+      }
+    ]
+  ];
+
+  if (donateUrl) {
+    buttons.push([
+      {
+        text: "💰 Донат",
+        url: donateUrl
+      }
+    ]);
   }
 
+  try {
+    await bot.sendMessage(CHANNEL_ID, "🔴 Стрим сейчас!", {
+      reply_markup: {
+        inline_keyboard: buttons
+      }
+    });
+
+    bot.sendMessage(chatId, "✅ Опубликовано.");
+  } catch (err) {
+    console.error("SEND ERROR:", err);
+    bot.sendMessage(chatId, "❌ Ошибка: не могу отправить сообщение в канал. Проверь, что я админ.");
+  }
+});
+
+// =======================================================
+//  WebApp endpoint
+// =======================================================
+app.get("/webapp", (req, res) => {
+  const src = req.query.src || "";
+
   res.send(`
-    <html>
-      <body style="margin:0; padding:0; background:#000;">
-        <iframe 
-          src="${src}"
-          style="border:0; width:100vw; height:100vh;"
-          allow="autoplay; encrypted-media; fullscreen"
-          allowfullscreen>
-        </iframe>
-      </body>
-    </html>
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title>Stream Viewer</title>
+    <style>
+      body { margin:0; background:#000; }
+      iframe {
+        width: 100vw;
+        height: 100vh;
+        border: none;
+      }
+    </style>
+  </head>
+  <body>
+    <iframe src="${src}" allowfullscreen allow="autoplay"></iframe>
+  </body>
+</html>
   `);
 });
 
-// Запуск
+// =======================================================
+//  Запуск сервера
+// =======================================================
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log("SERVER RUNNING", PORT));
