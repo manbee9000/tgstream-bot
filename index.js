@@ -1,3 +1,30 @@
+import express from "express";
+import TelegramBot from "node-telegram-bot-api";
+
+const TOKEN = process.env.BOT_TOKEN;
+const CHANNEL_ID = process.env.CHANNEL_ID;
+
+const app = express();
+app.use(express.json());
+
+// --- Telegram Webhook ---
+const bot = new TelegramBot(TOKEN, { webHook: true });
+const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
+bot.setWebHook(`${RENDER_URL}/webhook/${TOKEN}`);
+
+app.post(`/webhook/${TOKEN}`, (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
+});
+
+// --- Healthcheck ---
+app.get("/", (req, res) => {
+  res.send("BOT OK");
+});
+
+// =========================
+// 1) WebApp для просмотра
+// =========================
 app.get("/webapp", (req, res) => {
   const raw = req.query.src || "";
   const DOMAIN = "tgstream-bot.onrender.com";
@@ -30,18 +57,16 @@ if (!rawUrl) {
   try {
     const url = decodeURIComponent(rawUrl);
 
-    // ================= YOUTUBE =================
+    // ================= YouTube =================
     if (url.includes("youtube.com") || url.includes("youtu.be")) {
       msg.innerHTML = "Открываю YouTube…";
-      // В WebView iframe YouTube не работает — открываем напрямую
       window.location.href = url;
     }
 
-    // ================= VK (конвертация в embed) =================
+    // ================= VK =================
     else if (url.includes("vk.com/video")) {
       let embed = null;
-
-      const match = url.match(/video(-?\d+)_(\d+)/);
+      const match = url.match(/video(-?\\d+)_(\\d+)/);
       if (match) {
         embed = "https://vk.com/video_ext.php?oid=" + match[1] + "&id=" + match[2];
       }
@@ -68,7 +93,7 @@ if (!rawUrl) {
       }
     }
 
-    // ================= Fallback: просто открываем ссылку =================
+    // ================= Fallback =================
     else {
       msg.innerHTML = "Открываю…";
       window.location.href = url;
@@ -83,3 +108,86 @@ if (!rawUrl) {
 </body>
 </html>`);
 });
+
+// =========================
+// 2) Команды бота
+// =========================
+
+// /start
+bot.onText(/\/start/, (msg) => {
+  bot.sendMessage(
+    msg.chat.id,
+    "Бот работает.\nОтправь ссылку на стрим — я опубликую его в твоём канале."
+  );
+});
+
+// /donate <имя>
+let donateMap = {}; // память стримера
+
+bot.onText(/\/donate (.+)/, async (msg, match) => {
+  const username = match[1].trim();
+  donateMap[msg.chat.id] = username;
+
+  await bot.sendMessage(msg.chat.id, `Донаты настроены: https://www.donationalerts.com/r/${username}`);
+});
+
+// =========================
+// 3) Публикация стрима в канал
+// =========================
+bot.on("message", async (msg) => {
+  const text = msg.text;
+
+  if (!text) return;
+  if (msg.chat.type === "channel") return;
+
+  // Проверка: это ссылка?
+  if (text.startsWith("http://") || text.startsWith("https://")) {
+
+    const donateUser = donateMap[msg.chat.id] || null;
+    const donateUrl = donateUser
+      ? `https://www.donationalerts.com/r/${donateUser}`
+      : null;
+
+    const webappUrl =
+      `${RENDER_URL}/webapp?src=` + encodeURIComponent(text);
+
+    // сформировать кнопки
+    let keyboard = [
+      [{ text: "🎥 Смотреть стрим", web_app: { url: webappUrl } }]
+    ];
+
+    if (donateUser) {
+      keyboard.push([
+        { text: "💸 Сделать донат", url: donateUrl }
+      ]);
+    }
+
+    try {
+      // 1 пост — основной
+      await bot.sendMessage(
+        CHANNEL_ID,
+        "🔴 Стрим сейчас!\n\n🎥 Нажми «Смотреть стрим», чтобы открыть трансляцию.\n💬 Чат — в комментариях под постом ниже.\n💸 Донаты с сообщением — через кнопку ниже.",
+        {
+          reply_markup: {
+            inline_keyboard: keyboard
+          }
+        }
+      );
+
+      // 2 пост — чат
+      await bot.sendMessage(CHANNEL_ID, "💬 Чат стрима");
+
+      // подтверждение пользователю
+      await bot.sendMessage(msg.chat.id, "Опубликовано.");
+    } catch (e) {
+      console.log("SEND ERROR:", e);
+      await bot.sendMessage(msg.chat.id, "Ошибка: не могу отправить сообщение в канал. Проверь, что я админ.");
+    }
+  }
+});
+
+// =========================
+// 4) Запуск сервера
+// =========================
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log("SERVER RUNNING", PORT));
