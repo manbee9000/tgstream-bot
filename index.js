@@ -7,7 +7,7 @@ const CHANNEL_ID = process.env.CHANNEL_ID;
 const app = express();
 app.use(express.json());
 
-// --- Telegram Webhook ---
+// Telegram Webhook
 const bot = new TelegramBot(TOKEN, { webHook: true });
 const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
 bot.setWebHook(`${RENDER_URL}/webhook/${TOKEN}`);
@@ -17,14 +17,14 @@ app.post(`/webhook/${TOKEN}`, (req, res) => {
   res.sendStatus(200);
 });
 
-// --- Healthcheck ---
+// Healthcheck
 app.get("/", (req, res) => {
   res.send("BOT OK");
 });
 
-// =========================
-// 1) WebApp для просмотра
-// =========================
+// =======================
+// WEBAPP VIEWER
+// =======================
 app.get("/webapp", (req, res) => {
   const raw = req.query.src || "";
   const DOMAIN = "tgstream-bot.onrender.com";
@@ -36,9 +36,9 @@ app.get("/webapp", (req, res) => {
 <title>Stream Viewer</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  html, body { margin:0; padding:0; height:100%; background:#000; }
-  iframe { width:100%; height:100%; border:none; }
-  #msg { color:white; text-align:center; margin-top:40vh; font-size:18px; }
+html, body { margin:0; padding:0; height:100%; background:#000; }
+iframe { width:100%; height:100%; border:none; }
+#msg { color:white; text-align:center; margin-top:40vh; font-size:18px; }
 </style>
 </head>
 <body>
@@ -57,28 +57,24 @@ if (!rawUrl) {
   try {
     const url = decodeURIComponent(rawUrl);
 
-    // ================= YouTube =================
+    // YouTube
     if (url.includes("youtube.com") || url.includes("youtu.be")) {
       msg.innerHTML = "Открываю YouTube…";
       window.location.href = url;
     }
 
-    // ================= VK =================
+    // VK
     else if (url.includes("vk.com/video")) {
       let embed = null;
       const match = url.match(/video(-?\\d+)_(\\d+)/);
       if (match) {
         embed = "https://vk.com/video_ext.php?oid=" + match[1] + "&id=" + match[2];
       }
-
-      if (embed) {
-        frame.src = embed;
-      } else {
-        msg.innerHTML = "Не удалось распознать VK видео";
-      }
+      if (embed) frame.src = embed;
+      else msg.innerHTML = "Не удалось распознать VK видео";
     }
 
-    // ================= Twitch =================
+    // Twitch
     else if (url.includes("twitch.tv")) {
       const u = new URL(url);
       const parts = u.pathname.split("/").filter(Boolean);
@@ -88,12 +84,10 @@ if (!rawUrl) {
           "https://player.twitch.tv/?channel=" +
           encodeURIComponent(channel) +
           "&parent=${DOMAIN}";
-      } else {
-        msg.innerHTML = "Не удалось определить Twitch-канал";
-      }
+      } else msg.innerHTML = "Не удалось определить Twitch-канал";
     }
 
-    // ================= Fallback =================
+    // fallback
     else {
       msg.innerHTML = "Открываю…";
       window.location.href = url;
@@ -109,11 +103,12 @@ if (!rawUrl) {
 </html>`);
 });
 
-// =========================
-// 2) Команды бота
-// =========================
+// =======================
+// Команды /start, /donate
+// =======================
 
-// /start
+let donateMap = {}; 
+
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
@@ -121,44 +116,41 @@ bot.onText(/\/start/, (msg) => {
   );
 });
 
-// /donate <имя>
-let donateMap = {}; // память стримера
-
 bot.onText(/\/donate (.+)/, async (msg, match) => {
-  const username = match[1].trim();
-  donateMap[msg.chat.id] = username;
+  donateMap[msg.chat.id] = match[1].trim();
 
-  await bot.sendMessage(msg.chat.id, `Донаты настроены: https://www.donationalerts.com/r/${username}`);
+  await bot.sendMessage(
+    msg.chat.id,
+    `Донаты настроены: https://www.donationalerts.com/r/${match[1].trim()}`
+  );
 });
 
-// =========================
-// 3) Публикация стрима в канал
-// =========================
+// =======================
+// ПРИЁМ ССЫЛКИ НА СТРИМ
+// =======================
+
 bot.on("message", async (msg) => {
   const text = msg.text;
 
   if (!text) return;
   if (msg.chat.type === "channel") return;
 
-  // Проверка: это ссылка?
   if (text.startsWith("http://") || text.startsWith("https://")) {
 
     const donateUser = donateMap[msg.chat.id] || null;
-    const donateUrl = donateUser
-      ? `https://www.donationalerts.com/r/${donateUser}`
-      : null;
 
     const webappUrl =
-      `${RENDER_URL}/webapp?src=` + encodeURIComponent(text);
+      `${RENDER_URL}/webapp?src=` +
+      encodeURIComponent(text);
 
-    // сформировать кнопки
+    // ключевое отличие: ТОЛЬКО url кнопки
     let keyboard = [
-      [{ text: "🎥 Смотреть стрим", web_app: { url: webappUrl } }]
+      [{ text: "🎥 Смотреть стрим", url: webappUrl }]
     ];
 
     if (donateUser) {
       keyboard.push([
-        { text: "💸 Сделать донат", url: donateUrl }
+        { text: "💸 Сделать донат", url: `https://www.donationalerts.com/r/${donateUser}` }
       ]);
     }
 
@@ -166,7 +158,7 @@ bot.on("message", async (msg) => {
       // 1 пост — основной
       await bot.sendMessage(
         CHANNEL_ID,
-        "🔴 Стрим сейчас!\n\n🎥 Нажми «Смотреть стрим», чтобы открыть трансляцию.\n💬 Чат — в комментариях под постом ниже.\n💸 Донаты с сообщением — через кнопку ниже.",
+        "🔴 Стрим сейчас!\n\n🎥 Нажми «Смотреть стрим», чтобы открыть трансляцию.\n💬 Чат — в комментариях под постом ниже.\n💸 Донаты — через кнопку ниже.",
         {
           reply_markup: {
             inline_keyboard: keyboard
@@ -177,17 +169,19 @@ bot.on("message", async (msg) => {
       // 2 пост — чат
       await bot.sendMessage(CHANNEL_ID, "💬 Чат стрима");
 
-      // подтверждение пользователю
       await bot.sendMessage(msg.chat.id, "Опубликовано.");
     } catch (e) {
       console.log("SEND ERROR:", e);
-      await bot.sendMessage(msg.chat.id, "Ошибка: не могу отправить сообщение в канал. Проверь, что я админ.");
+      await bot.sendMessage(
+        msg.chat.id,
+        "Ошибка: не могу отправить сообщение в канал. Проверь, что я админ."
+      );
     }
   }
 });
 
-// =========================
-// 4) Запуск сервера
-// =========================
+// =======================
+// SERVER START
+// =======================
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log("SERVER RUNNING", PORT));
