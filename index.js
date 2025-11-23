@@ -5,6 +5,10 @@ const TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
 
+// ВАЖНО: ссылку DonationAlerts ты вставишь сюда
+// Пример: https://www.donationalerts.com/r/streamername
+const DONATE_URL = process.env.DONATE_URL || "https://www.donationalerts.com/r/streamername";
+
 const app = express();
 app.use(express.json());
 
@@ -15,50 +19,56 @@ const bot = new TelegramBot(TOKEN, { webHook: true });
 bot.setWebHook(`${RENDER_URL}/webhook/${TOKEN}`);
 console.log("Webhook set:", `${RENDER_URL}/webhook/${TOKEN}`);
 
-// Принимаем обновления от Telegram
+// Принимаем обновления
 app.post(`/webhook/${TOKEN}`, (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
 });
 
-// Проверка, что сервер жив
+// Проверка сервера
 app.get("/", (req, res) => {
   res.send("BOT OK");
 });
 
-// Логируем все входящие сообщения
+// Лог входящих
 bot.on("message", (msg) => {
   console.log("INCOMING MESSAGE:", JSON.stringify(msg, null, 2));
 });
 
-// Команда /start
+// /start
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(msg.chat.id, "Бот работает. Пришли ссылку на стрим.");
 });
 
-// Основная логика: принимаем ссылку, постим в канал
+// Ловим ссылку от стримера
 bot.on("message", async (msg) => {
   if (!msg.text) return;
   if (msg.chat.type === "channel") return;
 
   const text = msg.text.trim();
 
-  // только ссылки
   if (!text.startsWith("http://") && !text.startsWith("https://")) return;
 
-  // ссылка на наш webapp
   const webAppUrl = `${RENDER_URL}/webapp?src=${encodeURIComponent(text)}`;
 
+  const postText =
+    "🔴 **Стрим сейчас!**\n\n" +
+    "🎥 Нажми «Смотреть стрим», чтобы открыть трансляцию.\n" +
+    "💬 Чат — в комментариях под этим постом.\n" +
+    "💸 Донаты с сообщением — через кнопку ниже.\n";
+
   try {
-    // постим в канал
-    await bot.sendMessage(CHANNEL_ID, "🔴 Стрим сейчас!", {
+    await bot.sendMessage(CHANNEL_ID, postText, {
+      parse_mode: "Markdown",
       reply_markup: {
-        inline_keyboard: [[
-          {
-            text: "🎥 Смотреть стрим",
-            url: webAppUrl  // в канале можно только url-кнопки
-          }
-        ]]
+        inline_keyboard: [
+          [
+            { text: "🎥 Смотреть стрим", url: webAppUrl }
+          ],
+          [
+            { text: "💸 Отправить донат", url: DONATE_URL }
+          ]
+        ]
       }
     });
 
@@ -72,11 +82,9 @@ bot.on("message", async (msg) => {
   }
 });
 
-// Страница webapp: встраиваем стрим внутрь iframe
+// WebApp — плеер + встраивание
 app.get("/webapp", (req, res) => {
   const streamUrl = req.query.src || "";
-
-  // Жёстко прописываем домен для Twitch parent-параметра
   const PARENT_DOMAIN = "tgstream-bot.onrender.com";
 
   res.send(`<!DOCTYPE html>
@@ -90,84 +98,44 @@ app.get("/webapp", (req, res) => {
       margin: 0;
       padding: 0;
       height: 100%;
-      background: #000;
-      overflow: hidden;
-      font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+      background:#000;
     }
-    #player {
-      width: 100%;
-      height: 100%;
-      border: none;
-      background: #000;
-    }
-    #message {
-      color: #fff;
-      text-align: center;
-      margin-top: 40vh;
-      font-size: 18px;
+    iframe {
+      width:100%;
+      height:100%;
+      border:0;
+      background:#000;
     }
   </style>
 </head>
 <body>
-  <div id="message" style="display:none;"></div>
-  <iframe id="player" allowfullscreen></iframe>
+  <iframe id="player"></iframe>
 
   <script>
-    const rawSrc = ${JSON.stringify(streamUrl)};
-    const msgEl = document.getElementById('message');
-    const iframe = document.getElementById('player');
+    const raw = ${JSON.stringify(streamUrl)};
+    let src = "";
+    try { src = decodeURIComponent(raw); } catch(e){ src = raw; }
 
-    if (!rawSrc) {
-      msgEl.style.display = 'block';
-      msgEl.innerText = 'Нет ссылки на стрим';
-    } else {
-      try {
-        const src = decodeURIComponent(rawSrc);
-        let embedUrl = src;
+    let embed = src;
 
-        if (src.includes('twitch.tv')) {
-          // twitch embed: https://player.twitch.tv/?channel=CHANNEL&parent=DOMAIN
-          try {
-            const u = new URL(src);
-            const parts = u.pathname.split('/').filter(Boolean);
-            const channel = parts[0] || '';
-            if (channel) {
-              embedUrl = 'https://player.twitch.tv/?channel='
-                + encodeURIComponent(channel)
-                + '&parent=${PARENT_DOMAIN}';
-            }
-          } catch (e) {
-            embedUrl = src;
-          }
-        } else if (src.includes('youtube.com') || src.includes('youtu.be')) {
-          // YouTube embed
-          let videoId = '';
-          if (src.includes('watch?v=')) {
-            const u = new URL(src);
-            videoId = u.searchParams.get('v') || '';
-          } else if (src.includes('youtu.be/')) {
-            const u = new URL(src);
-            const parts = u.pathname.split('/').filter(Boolean);
-            videoId = parts[0] || '';
-          }
-          if (videoId) {
-            embedUrl = 'https://www.youtube.com/embed/' + videoId;
-          }
-        }
-
-        iframe.src = embedUrl;
-      } catch (e) {
-        msgEl.style.display = 'block';
-        msgEl.innerText = 'Ошибка загрузки стрима';
-      }
+    if (src.includes("twitch.tv")) {
+      const url = new URL(src);
+      const channel = url.pathname.split("/").filter(Boolean)[0];
+      embed = "https://player.twitch.tv/?channel=" + channel + "&parent=${PARENT_DOMAIN}";
     }
+    else if (src.includes("youtu")) {
+      let id = "";
+      if (src.includes("watch?v=")) id = new URL(src).searchParams.get("v");
+      else id = src.split("/").pop();
+      embed = "https://www.youtube.com/embed/" + id;
+    }
+
+    document.getElementById("player").src = embed;
   </script>
 </body>
 </html>`);
 });
 
-// Запускаем сервер
+// Запуск
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log("SERVER RUNNING", PORT);
-});
+app.listen(PORT, () => console.log("SERVER RUNNING", PORT));
