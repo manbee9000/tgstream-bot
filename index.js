@@ -14,6 +14,9 @@ const DA_DONATE_URL =
   process.env.DA_DONATE_URL || "https://dalink.to/mystreambot"; // твоя страница донатов
 const PRICE_PER_POST = parseInt(process.env.PRICE_PER_POST || "100", 10); // списание за один пост в ₽
 
+// твой Telegram ID — админ, который может создавать промокоды
+const ADMIN_ID = 618072923;
+
 // Определяем parent-домен (для Twitch)
 let PARENT_DOMAIN = "localhost";
 try {
@@ -184,12 +187,13 @@ async function publishStreamPost(channelId, embedUrl, thumbnail, donateName) {
 }
 
 // =====================================================================
-// MONGO DB: пользователи и заказы
+// MONGO DB: пользователи, заказы, промокоды
 // =====================================================================
 let mongoClient;
 let db;
 let usersCol;
 let ordersCol;
+let promoCol;
 
 async function initMongo() {
   if (!MONGODB_URI) {
@@ -204,6 +208,7 @@ async function initMongo() {
     db = mongoClient.db();
     usersCol = db.collection("users");
     ordersCol = db.collection("orders");
+    promoCol = db.collection("promocodes");
     console.log("MongoDB подключен");
   } catch (err) {
     console.error("Ошибка подключения к MongoDB:", err.message);
@@ -257,7 +262,7 @@ async function createOrder(tgId, amount) {
   const doc = {
     orderId,
     tgId,
-    amount,
+    amount: amount || 0,
     status: "pending",
     createdAt: new Date(),
   };
@@ -267,7 +272,10 @@ async function createOrder(tgId, amount) {
 
 function buildDonateUrl(orderId, amount) {
   const params = new URLSearchParams();
-  params.set("amount", String(amount));
+  // amount можно не указывать — стример выберет сумму на странице DA
+  if (amount && amount > 0) {
+    params.set("amount", String(amount));
+  }
   params.set("message", `ORDER_${orderId}`);
   return `${DA_DONATE_URL}?${params.toString()}`;
 }
@@ -287,12 +295,14 @@ async function ensureBalanceForPost(tgId, chatId) {
   const text =
     `Для публикации стрима необходим баланс не менее ${PRICE_PER_POST} ₽.\n` +
     `Сейчас на Вашем счёте: ${Math.round(currentBalance)} ₽.\n\n` +
-    `Пожалуйста, пополните баланс, чтобы разместить пост.`;
+    `Пожалуйста, пополните баланс, чтобы разместить пост.\n` +
+    `или введите промокод`;
 
   await bot.sendMessage(chatId, text, {
     reply_markup: {
       inline_keyboard: [
         [{ text: "Пополнить баланс", callback_data: "topup" }],
+        [{ text: "Ввести промокод", callback_data: "enter_promo" }],
       ],
     },
   });
@@ -335,7 +345,7 @@ async function handleDonation(donation) {
 
   let amountRub = parseFloat(donation.amount);
   if (!Number.isFinite(amountRub) || amountRub <= 0) {
-    amountRub = order.amount;
+    amountRub = order.amount || 0;
   }
 
   // Обновляем баланс пользователя
@@ -457,9 +467,61 @@ bot.onText(/\/balance/, async (msg) => {
   bot.sendMessage(msg.chat.id, `Ваш текущий баланс: ${Math.round(bal)} ₽.`);
 });
 
+// команда /create <code> <uses> — только для ADMIN_ID
+bot.onText(/\/create (\S+)\s+(\d+)/, async (msg, match) => {
+  const userId = msg.from.id;
+
+  if (userId !== ADMIN_ID) {
+    return bot.sendMessage(
+      msg.chat.id,
+      "У вас нет прав для создания промокодов."
+    );
+  }
+
+  if (!promoCol) {
+    return bot.sendMessage(
+      msg.chat.id,
+      "База данных недоступна, промокоды сейчас создать нельзя."
+    );
+  }
+
+  const rawCode = match[1].trim();
+  const uses = parseInt(match[2], 10);
+
+  if (!rawCode || !uses || uses <= 0) {
+    return bot.sendMessage(
+      msg.chat.id,
+      "Неверный формат. Пример:\n/create PROMO100 5"
+    );
+  }
+
+  const code = rawCode.toUpperCase();
+
+  await promoCol.updateOne(
+    { code },
+    {
+      $set: {
+        code,
+        uses,
+        createdBy: userId,
+        createdAt: new Date(),
+      },
+    },
+    { upsert: true }
+  );
+
+  bot.sendMessage(
+    msg.chat.id,
+    `Промокод *${code}* создан.\nДоступных использований: ${uses}.`,
+    { parse_mode: "Markdown" }
+  );
+});
+
 // =====================================================================
-// CALLBACK-ЗАПРОСЫ (кнопки пополнения баланса)
+// CALLBACK-ЗАПРОСЫ (кнопки пополнения баланса и промокоды)
 // =====================================================================
+const awaitingPromo = {}; // userId -> true/false
+
 bot.on("callback_query", async (query) => {
   const { id, from, data, message } = query;
   const chatId = message?.chat?.id;
@@ -467,58 +529,38 @@ bot.on("callback_query", async (query) => {
 
   try {
     if (data === "topup") {
-      // предлагаем варианты пополнения
-      const text =
-        "Выберите сумму пополнения. После оплаты баланс будет пополнен автоматически:";
-      const keyboard = {
-        inline_keyboard: [
-          [
-            { text: "100 ₽", callback_data: "pay_100" },
-            { text: "300 ₽", callback_data: "pay_300" },
-          ],
-          [
-            { text: "500 ₽", callback_data: "pay_500" },
-            { text: "1000 ₽", callback_data: "pay_1000" },
-          ],
-          [{ text: "10000 ₽", callback_data: "pay_10000" }],
-        ],
-      };
-
-      await bot.sendMessage(chatId, text, { reply_markup: keyboard });
-    } else if (data && data.startsWith("pay_")) {
-      const amount = parseInt(data.split("_")[1], 10);
-      if (!amount || amount <= 0) {
+      // создаём заказ без фиксированной суммы, стример выберет её на странице DA
+      const orderId = await createOrder(userId, 0);
+      if (!orderId) {
         await bot.sendMessage(
           chatId,
-          "Не удалось определить сумму пополнения. Попробуйте ещё раз."
+          "Сейчас пополнение баланса недоступно (ошибка базы данных). Попробуйте позже."
         );
       } else {
-        const orderId = await createOrder(userId, amount);
-        if (!orderId) {
-          await bot.sendMessage(
-            chatId,
-            "Сейчас пополнение баланса недоступно (ошибка базы данных). Попробуйте позже."
-          );
-        } else {
-          const payUrl = buildDonateUrl(orderId, amount);
-          const txt =
-            `Для пополнения баланса на ${amount} ₽ перейдите по ссылке ниже и завершите оплату.\n\n` +
-            `Публикации будут начислены автоматически после подтверждения платежа DonationAlerts.`;
+        const payUrl = buildDonateUrl(orderId, 0);
+        const txt =
+          "Чтобы пополнить баланс, перейдите по ссылке ниже, выберите сумму и завершите оплату.\n\n" +
+          "Публикации будут начислены автоматически после подтверждения платежа DonationAlerts.";
 
-          await bot.sendMessage(chatId, txt, {
-            reply_markup: {
-              inline_keyboard: [
-                [
-                  {
-                    text: "Оплатить через DonationAlerts",
-                    url: payUrl,
-                  },
-                ],
+        await bot.sendMessage(chatId, txt, {
+          reply_markup: {
+            inline_keyboard: [
+              [
+                {
+                  text: "Оплатить через DonationAlerts",
+                  url: payUrl,
+                },
               ],
-            },
-          });
-        }
+            ],
+          },
+        });
       }
+    } else if (data === "enter_promo") {
+      awaitingPromo[userId] = true;
+      await bot.sendMessage(
+        chatId,
+        "Введите ваш промокод одним сообщением:"
+      );
     }
   } catch (err) {
     console.error("Ошибка в callback_query:", err.message);
@@ -532,12 +574,49 @@ bot.on("callback_query", async (query) => {
 });
 
 // =====================================================================
-// ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ (канал + ссылки на стримы)
+// ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ (канал + ссылки на стримы + промокоды)
 // =====================================================================
 bot.on("message", async (msg) => {
   try {
     const text = msg.text || "";
     const userId = msg.from.id;
+
+    // Обработка ввода промокода
+    if (awaitingPromo[userId] && !text.startsWith("/")) {
+      awaitingPromo[userId] = false;
+
+      if (!promoCol) {
+        return bot.sendMessage(
+          msg.chat.id,
+          "Сейчас промокоды недоступны (ошибка базы данных)."
+        );
+      }
+
+      const codeInput = text.trim().toUpperCase();
+      const promo = await promoCol.findOne({ code: codeInput });
+
+      if (!promo || !promo.uses || promo.uses <= 0) {
+        return bot.sendMessage(
+          msg.chat.id,
+          "Неверный или уже исчерпанный промокод."
+        );
+      }
+
+      await promoCol.updateOne(
+        { _id: promo._id },
+        { $inc: { uses: -1 } }
+      );
+
+      const user = await updateUserBalance(userId, PRICE_PER_POST);
+      const newBalance = user?.balance || 0;
+
+      return bot.sendMessage(
+        msg.chat.id,
+        `Промокод успешно применён!\n` +
+          `На ваш баланс начислено ${PRICE_PER_POST} ₽.\n` +
+          `Текущий баланс: ${Math.round(newBalance)} ₽.`
+      );
+    }
 
     // Подключение канала (пересланное сообщение из канала)
     if (msg.forward_from_chat && msg.forward_from_chat.type === "channel") {
