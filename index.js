@@ -913,13 +913,13 @@ bot.on("callback_query", async (query) => {
           );
         } else {
           const redirectUri = `${RENDER_URL}${DA_REDIRECT_PATH}`;
-          const scope = "oauth-donation-index oauth-donation-subscribe";
+        
           const authUrl =
             "https://www.donationalerts.com/oauth/authorize" +
             `?client_id=${encodeURIComponent(DA_CLIENT_ID)}` +
             `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-            `&response_type=code` +
-            `&scope=${encodeURIComponent(scope)}`;
+            `&response_type=code`;
+            
 
           await bot.sendMessage(
             chatId,
