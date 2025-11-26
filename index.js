@@ -2,7 +2,6 @@ import express from "express";
 import TelegramBot from "node-telegram-bot-api";
 import axios from "axios";
 import { MongoClient } from "mongodb";
-import WebSocket from "ws";
 
 // ================== CONFIG ==================
 const TOKEN = process.env.BOT_TOKEN;
@@ -17,14 +16,10 @@ const DA_DONATE_URL =
 // Стоимость одной публикации
 const PRICE_PER_POST = parseInt(process.env.PRICE_PER_POST || "100", 10);
 
-// OAuth-приложение DonationAlerts
-const DA_CLIENT_ID = process.env.DA_CLIENT_ID || "16659";
-const DA_CLIENT_SECRET = process.env.DA_CLIENT_SECRET || null;
+// Personal Access Token DonationAlerts (ставим в ENV: DA_API_TOKEN)
+const DA_API_TOKEN = process.env.DA_API_TOKEN || null;
 
-// Redirect-URL для OAuth (должен совпадать с тем, что в настройках DA)
-const DA_REDIRECT_PATH = "/da-oauth";
-
-// Админ для создания промокодов и авторизации DA
+// Админ для создания промокодов
 const ADMIN_TG_ID = 618072923;
 
 // Определяем parent-домен (для Twitch)
@@ -46,7 +41,9 @@ if (!TOKEN) {
   process.exit(1);
 }
 if (!RENDER_URL) {
-  console.error("Внимание: RENDER_EXTERNAL_URL не задан! WebApp-кнопка может работать некорректно.");
+  console.error(
+    "Внимание: RENDER_EXTERNAL_URL не задан! WebApp-кнопка может работать некорректно."
+  );
 }
 
 // ================== TELEGRAM WEBHOOK ==================
@@ -79,7 +76,8 @@ app.get("/webapp", (req, res) => {
 function extractYouTubeId(url) {
   try {
     if (url.includes("watch?v=")) return url.split("v=")[1].split("&")[0];
-    if (url.includes("youtu.be/")) return url.split("youtu.be/")[1].split("?")[0];
+    if (url.includes("youtu.be/"))
+      return url.split("youtu.be/")[1].split("?")[0];
   } catch {}
   return null;
 }
@@ -189,7 +187,6 @@ let db;
 let usersCol;
 let ordersCol;
 let promoCol;
-let settingsCol;
 
 async function initMongo() {
   if (!MONGODB_URI) {
@@ -205,7 +202,6 @@ async function initMongo() {
     usersCol = db.collection("users");
     ordersCol = db.collection("orders");
     promoCol = db.collection("promocodes");
-    settingsCol = db.collection("settings");
     console.log("MongoDB подключен");
   } catch (err) {
     console.error("Ошибка подключения к MongoDB:", err.message);
@@ -285,7 +281,7 @@ async function applyPromocode(tgId, code) {
     };
   }
 
-  const postsToAdd = promo.remainingPosts; // всё количество доступных публикаций
+  const postsToAdd = promo.remainingPosts;
   const amountRub = postsToAdd * PRICE_PER_POST;
 
   const user = await updateUserBalance(tgId, amountRub);
@@ -366,158 +362,7 @@ async function chargeForPost(tgId) {
   await updateUserBalance(tgId, -PRICE_PER_POST);
 }
 
-// ================== DonationAlerts: OAuth + WebSocket ==================
-
-// В памяти
-let daAccessToken = null;
-let daRefreshToken = null;
-let daTokenExpiresAt = null; // Date
-let daUserId = null;
-
-let daWs = null;
-let daWsClientId = null;
-let daReconnectTimer = null;
-
-// загрузка токенов из Mongo
-async function loadDaTokensFromDb() {
-  if (!settingsCol) return;
-  const doc = await settingsCol.findOne({ _id: "da_oauth" });
-  if (!doc) return;
-
-  daAccessToken = doc.accessToken || null;
-  daRefreshToken = doc.refreshToken || null;
-  daTokenExpiresAt = doc.expiresAt ? new Date(doc.expiresAt) : null;
-  daUserId = doc.userId || null;
-}
-
-// сохранение токенов в Mongo
-async function saveDaTokensToDb() {
-  if (!settingsCol) return;
-  await settingsCol.updateOne(
-    { _id: "da_oauth" },
-    {
-      $set: {
-        accessToken: daAccessToken,
-        refreshToken: daRefreshToken,
-        expiresAt: daTokenExpiresAt,
-        userId: daUserId,
-        updatedAt: new Date(),
-      },
-    },
-    { upsert: true }
-  );
-}
-
-// обмен code -> token
-async function exchangeCodeForToken(code) {
-  if (!DA_CLIENT_ID || !DA_CLIENT_SECRET) {
-    throw new Error("DA_CLIENT_ID или DA_CLIENT_SECRET не заданы.");
-  }
-
-  const redirectUri = `${RENDER_URL}${DA_REDIRECT_PATH}`;
-  const body = new URLSearchParams();
-  body.set("client_id", DA_CLIENT_ID);
-  body.set("client_secret", DA_CLIENT_SECRET);
-  body.set("grant_type", "authorization_code");
-  body.set("redirect_uri", redirectUri);
-  body.set("code", code);
-
-  const resp = await axios.post(
-    "https://www.donationalerts.com/oauth/token",
-    body.toString(),
-    {
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    }
-  );
-
-  const data = resp.data || {};
-
-  daAccessToken = data.access_token;
-  daRefreshToken = data.refresh_token || null;
-  daTokenExpiresAt = new Date(
-    Date.now() + (data.expires_in ? data.expires_in * 1000 : 3600 * 1000)
-  );
-  // userId получим отдельным запросом /user/oauth
-
-  await saveDaTokensToDb();
-}
-
-// обновление токена по refresh_token при необходимости
-async function ensureDaAccessToken() {
-  if (!daAccessToken) return false;
-  if (!daTokenExpiresAt) return true;
-
-  const now = Date.now();
-  const expiresInMs = daTokenExpiresAt.getTime() - now;
-
-  // обновляем за минуту до истечения
-  if (expiresInMs > 60 * 1000) return true;
-
-  if (!daRefreshToken) return true;
-
-  try {
-    const body = new URLSearchParams();
-    body.set("client_id", DA_CLIENT_ID);
-    body.set("client_secret", DA_CLIENT_SECRET);
-    body.set("grant_type", "refresh_token");
-    body.set("refresh_token", daRefreshToken);
-
-    const resp = await axios.post(
-      "https://www.donationalerts.com/oauth/token",
-      body.toString(),
-      { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
-    );
-
-    const data = resp.data || {};
-    daAccessToken = data.access_token;
-    daRefreshToken = data.refresh_token || daRefreshToken;
-    daTokenExpiresAt = new Date(
-      Date.now() + (data.expires_in ? data.expires_in * 1000 : 3600 * 1000)
-    );
-
-    await saveDaTokensToDb();
-    console.log("DA OAuth: access_token обновлён.");
-    return true;
-  } catch (err) {
-    console.error(
-      "Ошибка обновления DA access_token:",
-      err.response?.data || err.message
-    );
-    return false;
-  }
-}
-
-// получение userId и socket_connection_token
-async function fetchDaUserInfo() {
-  if (!daAccessToken) return null;
-
-  const resp = await axios.get(
-    "https://www.donationalerts.com/api/v1/user/oauth",
-    {
-      headers: {
-        Authorization: `Bearer ${daAccessToken}`,
-      },
-    }
-  );
-
-  const data = resp.data?.data || resp.data || {};
-  // data.id, data.socket_connection_token
-  return data;
-}
-
-function extractDonationFromWsMessage(msg) {
-  // Формат сообщений Centrifugo может меняться, поэтому пробуем несколько вариантов.
-  if (msg.result && msg.result.data && msg.result.data.data) {
-    return msg.result.data.data;
-  }
-  if (msg.result && msg.result.data && msg.result.data.amount) {
-    return msg.result.data;
-  }
-  if (msg.data && msg.data.data) {
-    return msg.data.data;
-  }
-  return null;
-}
+// ================== DonationAlerts: REST polling ==================
 
 async function handleDonation(donation) {
   if (!ordersCol || !usersCol) return;
@@ -577,168 +422,40 @@ async function handleDonation(donation) {
   }
 }
 
-// запуск WebSocket-подключения к DonationAlerts (Centrifugo)
-async function startDonationAlertsRealtime() {
-  if (!DA_CLIENT_ID || !DA_CLIENT_SECRET) {
-    console.log(
-      "DA_CLIENT_ID или DA_CLIENT_SECRET не заданы. Автоучёт оплат DonationAlerts отключён."
-    );
-    return;
-  }
-  if (!daAccessToken) {
-    console.log(
-      "DA OAuth ещё не выполнен. Для подключения DonationAlerts нажмите кнопку «Авторизовать DonationAlerts» в боте."
-    );
-    return;
-  }
-
-  const ok = await ensureDaAccessToken();
-  if (!ok) return;
+// опрос DonationAlerts каждые 5 секунд
+async function pollDonationAlerts() {
+  if (!DA_API_TOKEN) return;
+  if (!ordersCol || !usersCol) return;
 
   try {
-    const userInfo = await fetchDaUserInfo();
-    if (!userInfo) {
-      console.error("DA: не удалось получить user info.");
-      return;
-    }
+    const resp = await axios.get(
+      "https://www.donationalerts.com/api/v1/alerts/donations",
+      {
+        headers: {
+          Authorization: `Bearer ${DA_API_TOKEN}`,
+        },
+        params: {
+          limit: 50,
+        },
+      }
+    );
 
-    daUserId = userInfo.id;
-    const socketToken = userInfo.socket_connection_token;
+    const list = resp.data?.data || resp.data || [];
+    if (!Array.isArray(list)) return;
 
-    if (!daUserId || !socketToken) {
-      console.error(
-        "DA: userId или socket_connection_token отсутствуют в ответе."
-      );
-      return;
-    }
-
-    await saveDaTokensToDb(); // сохраним userId
-
-    // Открываем WebSocket
-    const wsUrl = "wss://centrifugo.donationalerts.com/connection/websocket";
-
-    if (daWs) {
+    for (const donation of list) {
       try {
-        daWs.close();
-      } catch {}
-      daWs = null;
-    }
-
-    console.log("Подключаемся к DonationAlerts WebSocket...");
-    daWs = new WebSocket(wsUrl);
-
-    daWs.on("open", () => {
-      try {
-        // Шаг 1: отправляем socket_connection_token
-        const connectMsg = {
-          params: { token: socketToken },
-          id: 1,
-        };
-        daWs.send(JSON.stringify(connectMsg));
+        await handleDonation(donation);
       } catch (e) {
-        console.error("Ошибка отправки connectMsg в DA WebSocket:", e.message);
+        console.error("Ошибка обработки доната:", e.message);
       }
-    });
-
-    daWs.on("message", async (raw) => {
-      let msg;
-      try {
-        msg = JSON.parse(raw);
-      } catch {
-        return;
-      }
-
-      // Ответ на connect (id=1) с client UUID
-      if (msg.id === 1 && msg.result && msg.result.client) {
-        daWsClientId = msg.result.client;
-        console.log("DA WebSocket: clientId =", daWsClientId);
-
-        // Шаг 2: запрос токена для подписки на канал донатов
-        try {
-          const resp = await axios.post(
-            "https://www.donationalerts.com/api/v1/centrifuge/subscribe",
-            {
-              channels: [`$alerts:donation_${daUserId}`],
-              client: daWsClientId,
-            },
-            {
-              headers: {
-                Authorization: `Bearer ${daAccessToken}`,
-                "Content-Type": "application/json",
-              },
-            }
-          );
-
-          const arr = resp.data?.channels || [];
-          const ch = arr.find((c) =>
-            c.channel.includes(`$alerts:donation_${daUserId}`)
-          );
-          if (!ch) {
-            console.error("DA: не удалось получить channel token.");
-            return;
-          }
-
-          const subMsg = {
-            params: {
-              channel: ch.channel,
-              token: ch.token,
-            },
-            method: 1,
-            id: 2,
-          };
-          daWs.send(JSON.stringify(subMsg));
-          console.log("DA WebSocket: подписка на", ch.channel);
-        } catch (err) {
-          console.error(
-            "Ошибка подписки на DA канал:",
-            err.response?.data || err.message
-          );
-        }
-
-        return;
-      }
-
-      // Подтверждение подписки (id=2) можно проигнорировать
-      if (msg.id === 2) {
-        // console.log("DA WebSocket: subscription ACK", msg.result);
-        return;
-      }
-
-      // Остальные сообщения — потенциальные донаты
-      const donation = extractDonationFromWsMessage(msg);
-      if (donation) {
-        try {
-          await handleDonation(donation);
-        } catch (err) {
-          console.error("Ошибка в handleDonation:", err.message);
-        }
-      }
-    });
-
-    daWs.on("error", (err) => {
-      console.error("DA WebSocket error:", err.message);
-    });
-
-    daWs.on("close", () => {
-      console.log("DA WebSocket: соединение закрыто.");
-      scheduleDaReconnect();
-    });
+    }
   } catch (err) {
     console.error(
-      "Ошибка при инициализации DonationAlerts realtime:",
+      "Ошибка при опросе DonationAlerts:",
       err.response?.data || err.message
     );
-    scheduleDaReconnect();
   }
-}
-
-function scheduleDaReconnect(delayMs = 30000) {
-  if (daReconnectTimer) return;
-  daReconnectTimer = setTimeout(async () => {
-    daReconnectTimer = null;
-    console.log("Пытаемся переподключиться к DonationAlerts...");
-    await startDonationAlertsRealtime();
-  }, delayMs);
 }
 
 // ================== TELEGRAM: конфиг стримера ==================
@@ -804,13 +521,7 @@ bot.onText(/\/start/, (msg) => {
     "После подключения Вы сможете отправлять ссылки на трансляции.\n\n" +
     `Публикация стрима списывает с баланса ${PRICE_PER_POST} ₽. Баланс можно пополнить в боте.`;
 
-  const keyboard = {
-    inline_keyboard: [
-      [{ text: "Авторизовать DonationAlerts", callback_data: "da_auth" }],
-    ],
-  };
-
-  bot.sendMessage(msg.chat.id, text, { reply_markup: keyboard });
+  bot.sendMessage(msg.chat.id, text);
 });
 
 // ================== /balance ==================
@@ -824,7 +535,7 @@ bot.onText(/\/balance/, async (msg) => {
   const keyboard = {
     inline_keyboard: [
       [{ text: "Пополнить баланс", callback_data: "topup" }],
-      [{ text: "Авторизовать DonationAlerts", callback_data: "da_auth" }],
+      [{ text: "Ввести промокод", callback_data: "promo_enter" }],
     ],
   };
 
@@ -899,41 +610,6 @@ bot.on("callback_query", async (query) => {
         chatId,
         "Отправьте промокод одним сообщением (например: VOLNA100)."
       );
-    } else if (data === "da_auth") {
-      if (userId !== ADMIN_TG_ID) {
-        await bot.sendMessage(
-          chatId,
-          "Авторизовать DonationAlerts может только владелец бота."
-        );
-      } else {
-        if (!DA_CLIENT_ID || !DA_CLIENT_SECRET) {
-          await bot.sendMessage(
-            chatId,
-            "Переменные DA_CLIENT_ID и DA_CLIENT_SECRET не заданы на сервере."
-          );
-        } else {
-          const redirectUri = `${RENDER_URL}${DA_REDIRECT_PATH}`;
-        
-          const authUrl =
-            "https://www.donationalerts.com/oauth/authorize" +
-            `?client_id=${encodeURIComponent(DA_CLIENT_ID)}` +
-            `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-            `&response_type=code`;
-            
-
-          await bot.sendMessage(
-            chatId,
-            "Нажмите кнопку ниже, чтобы авторизовать DonationAlerts и включить автоматическое пополнение баланса:",
-            {
-              reply_markup: {
-                inline_keyboard: [
-                  [{ text: "Авторизовать DonationAlerts", url: authUrl }],
-                ],
-              },
-            }
-          );
-        }
-      }
     }
   } catch (err) {
     console.error("Ошибка в callback_query:", err.message);
@@ -1026,44 +702,18 @@ bot.on("message", async (msg) => {
   }
 });
 
-// ================== OAuth callback DonationAlerts ==================
-app.get(DA_REDIRECT_PATH, async (req, res) => {
-  const code = req.query.code;
-  if (!code) {
-    return res.status(400).send("Не передан параметр code.");
-  }
-
-  try {
-    await exchangeCodeForToken(String(code));
-    // после получения access_token сразу пытаемся запустить realtime
-    await startDonationAlertsRealtime();
-    res.send(
-      "DonationAlerts успешно авторизован. Можете вернуться в Telegram-бот."
-    );
-  } catch (err) {
-    console.error(
-      "Ошибка в обработчике DA OAuth:",
-      err.response?.data || err.message
-    );
-    res
-      .status(500)
-      .send("Произошла ошибка при авторизации DonationAlerts. Попробуйте позже.");
-  }
-});
-
 // ================== СТАРТ СЕРВЕРА ==================
 async function start() {
   await initMongo();
-  await loadDaTokensFromDb();
 
-  // если токены уже есть — пробуем сразу подключиться к DA realtime
-  if (daAccessToken) {
-    startDonationAlertsRealtime().catch((e) =>
-      console.error("Ошибка старта DA realtime:", e.message)
+  if (DA_API_TOKEN) {
+    console.log(
+      "Запускаем опрос DonationAlerts каждые 5 секунд..."
     );
+    setInterval(pollDonationAlerts, 5000);
   } else {
     console.log(
-      "DA OAuth токены не найдены. Нажмите в боте кнопку «Авторизовать DonationAlerts», чтобы включить автоучёт оплат."
+      "DA_API_TOKEN не задан. Автоматический учёт оплат DonationAlerts отключён."
     );
   }
 
