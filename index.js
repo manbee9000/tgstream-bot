@@ -2,6 +2,7 @@ import express from "express";
 import TelegramBot from "node-telegram-bot-api";
 import axios from "axios";
 import { MongoClient } from "mongodb";
+import WebSocket from "ws";
 
 // ================== CONFIG ==================
 const TOKEN = process.env.BOT_TOKEN;
@@ -10,17 +11,29 @@ const PORT = process.env.PORT || 10000;
 
 const MONGODB_URI = process.env.MONGODB_URI;
 
-// Стоимость одной публикации (в рублях)
+const DA_DONATE_URL =
+  process.env.DA_DONATE_URL || "https://dalink.to/mystreambot";
+
+// Стоимость одной публикации
 const PRICE_PER_POST = parseInt(process.env.PRICE_PER_POST || "100", 10);
 
-// YooMoney
-const YOOMONEY_WALLET = process.env.YOOMONEY_WALLET;          // "4100...."
-const YOOMONEY_ACCESS_TOKEN = process.env.YOOMONEY_ACCESS_TOKEN; // access_token с правами account-info + operation-history
+// OAuth-приложение DonationAlerts
+const DA_CLIENT_ID = process.env.DA_CLIENT_ID || null;
+const DA_CLIENT_SECRET = process.env.DA_CLIENT_SECRET || null;
 
-// Админ для создания промокодов
+// Скоупы строго согласно документации DA
+// oauth-user-show — для /api/v1/user/oauth
+// oauth-donation-subscribe — для подписки на $alerts:donation_<user_id>
+const DA_SCOPES =
+  process.env.DA_SCOPES || "oauth-user-show oauth-donation-subscribe";
+
+// Redirect-URL для OAuth (должен совпадать с тем, что в настройках DA)
+const DA_REDIRECT_PATH = "/da-oauth";
+
+// Админ для создания промокодов и авторизации DA
 const ADMIN_TG_ID = 618072923;
 
-// Определяем parent-домен (для Twitch iframe)
+// Определяем parent-домен (для Twitch)
 let PARENT_DOMAIN = "localhost";
 try {
   if (RENDER_URL) {
@@ -149,11 +162,10 @@ async function publishStreamPost(channelId, embedUrl, thumbnail, donateName) {
     ],
   ];
 
-  // Кнопка доната ДЛЯ СТРИМЕРА (мы к этим деньгам не имеем отношения)
   if (donateName) {
     buttons.push([
       {
-        text: "💸 Донат стримеру",
+        text: "💸 Донат",
         url: `https://www.donationalerts.com/r/${donateName}`,
       },
     ]);
@@ -163,7 +175,7 @@ async function publishStreamPost(channelId, embedUrl, thumbnail, donateName) {
     "🔴 Не пропустите стрим!\n\n" +
     "🎥 Нажмите «Смотреть стрим», чтобы открыть трансляцию.\n" +
     "💬 Чат находится в комментариях под постом.\n" +
-    "💸 Донат — через соответствующую кнопку ниже (если она есть).";
+    "💸 Донат — через соответствующую кнопку ниже.";
 
   if (thumbnail) {
     await bot.sendPhoto(channelId, thumbnail, {
@@ -185,6 +197,7 @@ let db;
 let usersCol;
 let ordersCol;
 let promoCol;
+let settingsCol;
 
 async function initMongo() {
   if (!MONGODB_URI) {
@@ -200,6 +213,7 @@ async function initMongo() {
     usersCol = db.collection("users");
     ordersCol = db.collection("orders");
     promoCol = db.collection("promocodes");
+    settingsCol = db.collection("settings");
     console.log("MongoDB подключен");
   } catch (err) {
     console.error("Ошибка подключения к MongoDB:", err.message);
@@ -279,7 +293,7 @@ async function applyPromocode(tgId, code) {
     };
   }
 
-  const postsToAdd = promo.remainingPosts; // сколько бесплатных публикаций
+  const postsToAdd = promo.remainingPosts;
   const amountRub = postsToAdd * PRICE_PER_POST;
 
   const user = await updateUserBalance(tgId, amountRub);
@@ -300,9 +314,9 @@ async function applyPromocode(tgId, code) {
   };
 }
 
-// ================== ЗАКАЗЫ (оплата через YooMoney) ==================
+// ================== ЗАКАЗЫ (через DonationAlerts) ==================
 function generateOrderId() {
-  return "YM" + Math.random().toString(36).slice(2, 10);
+  return Math.random().toString(36).slice(2, 10);
 }
 
 async function createOrder(tgId, amount) {
@@ -312,17 +326,26 @@ async function createOrder(tgId, amount) {
     orderId,
     tgId,
     amount,
-    status: "pending", // pending / paid
+    status: "pending",
     createdAt: new Date(),
-    provider: "yoomoney",
   };
   await ordersCol.insertOne(doc);
   return orderId;
 }
 
+function buildDonateUrl(orderId, amount) {
+  // Параметры формы доната не описаны в API, поэтому используем
+  // только документированные поля в самом донате (message).
+  // Здесь мы просто формируем URL с комментарием ORDER_<id>,
+  // который потом найдём в donation.message через WebSocket.
+  const params = new URLSearchParams();
+  params.set("message", `ORDER_${orderId}`);
+  params.set("amount", String(amount));
+  return `${DA_DONATE_URL}?${params.toString()}`;
+}
+
 // Проверка баланса перед постом
 async function ensureBalanceForPost(tgId, chatId) {
-  // если нет Mongo — не блокируем
   if (!usersCol) return true;
 
   const user = await getOrCreateUser(tgId);
@@ -354,199 +377,399 @@ async function chargeForPost(tgId) {
   await updateUserBalance(tgId, -PRICE_PER_POST);
 }
 
-// ================== YooMoney: платёжная страница и опрос API ==================
+// ================== DonationAlerts: OAuth + WebSocket ==================
 
-// Страница, на которую ведут кнопки оплаты из бота
-// /pay?order=YMxxxx
-app.get("/pay", async (req, res) => {
-  const orderId = String(req.query.order || "").trim();
-  if (!orderId) {
-    return res.status(400).send("Не указан номер заказа.");
+// В памяти
+let daAccessToken = null;
+let daRefreshToken = null;
+let daTokenExpiresAt = null; // Date
+let daUserId = null;
+
+let daWs = null;
+let daWsClientId = null;
+let daReconnectTimer = null;
+
+// загрузка токенов из Mongo
+async function loadDaTokensFromDb() {
+  if (!settingsCol) return;
+  const doc = await settingsCol.findOne({ _id: "da_oauth" });
+  if (!doc) return;
+
+  daAccessToken = doc.accessToken || null;
+  daRefreshToken = doc.refreshToken || null;
+  daTokenExpiresAt = doc.expiresAt ? new Date(doc.expiresAt) : null;
+  daUserId = doc.userId || null;
+}
+
+// сохранение токенов в Mongo
+async function saveDaTokensToDb() {
+  if (!settingsCol) return;
+  await settingsCol.updateOne(
+    { _id: "da_oauth" },
+    {
+      $set: {
+        accessToken: daAccessToken,
+        refreshToken: daRefreshToken,
+        expiresAt: daTokenExpiresAt,
+        userId: daUserId,
+        updatedAt: new Date(),
+      },
+    },
+    { upsert: true }
+  );
+}
+
+// обмен code -> token (Authorization Code Grant) :contentReference[oaicite:1]{index=1}
+async function exchangeCodeForToken(code) {
+  if (!DA_CLIENT_ID || !DA_CLIENT_SECRET) {
+    throw new Error("DA_CLIENT_ID или DA_CLIENT_SECRET не заданы.");
   }
 
-  if (!YOOMONEY_WALLET) {
-    return res
-      .status(500)
-      .send("Платёж временно недоступен: кошелёк YooMoney не настроен.");
-  }
+  const redirectUri = `${RENDER_URL}${DA_REDIRECT_PATH}`;
+  const body = new URLSearchParams();
+  body.set("client_id", DA_CLIENT_ID);
+  body.set("client_secret", DA_CLIENT_SECRET);
+  body.set("grant_type", "authorization_code");
+  body.set("redirect_uri", redirectUri);
+  body.set("code", code);
 
-  if (!ordersCol) {
-    return res
-      .status(500)
-      .send("Сервер временно недоступен (нет подключения к базе данных).");
-  }
+  const resp = await axios.post(
+    "https://www.donationalerts.com/oauth/token",
+    body.toString(),
+    {
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    }
+  );
 
-  const order = await ordersCol.findOne({ orderId });
-  if (!order) {
-    return res.status(404).send("Заказ не найден.");
-  }
+  const data = resp.data || {};
 
-  if (order.status === "paid") {
-    return res.send(
-      "Этот счёт уже оплачен. Можете вернуться в Telegram-бот."
+  daAccessToken = data.access_token;
+  daRefreshToken = data.refresh_token || null;
+  daTokenExpiresAt = new Date(
+    Date.now() + (data.expires_in ? data.expires_in * 1000 : 3600 * 1000)
+  );
+
+  await saveDaTokensToDb();
+}
+
+// обновление токена по refresh_token при необходимости (обязательно с scope) :contentReference[oaicite:2]{index=2}
+async function ensureDaAccessToken() {
+  if (!daAccessToken) return false;
+  if (!daTokenExpiresAt) return true;
+
+  const now = Date.now();
+  const expiresInMs = daTokenExpiresAt.getTime() - now;
+
+  // обновляем за минуту до истечения
+  if (expiresInMs > 60 * 1000) return true;
+
+  if (!daRefreshToken) return true;
+
+  try {
+    const body = new URLSearchParams();
+    body.set("client_id", DA_CLIENT_ID);
+    body.set("client_secret", DA_CLIENT_SECRET);
+    body.set("grant_type", "refresh_token");
+    body.set("refresh_token", daRefreshToken);
+    body.set("scope", DA_SCOPES);
+
+    const resp = await axios.post(
+      "https://www.donationalerts.com/oauth/token",
+      body.toString(),
+      { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
     );
+
+    const data = resp.data || {};
+    daAccessToken = data.access_token;
+    daRefreshToken = data.refresh_token || daRefreshToken;
+    daTokenExpiresAt = new Date(
+      Date.now() + (data.expires_in ? data.expires_in * 1000 : 3600 * 1000)
+    );
+
+    await saveDaTokensToDb();
+    console.log("DA OAuth: access_token обновлён.");
+    return true;
+  } catch (err) {
+    console.error(
+      "Ошибка обновления DA access_token:",
+      err.response?.data || err.message
+    );
+    return false;
+  }
+}
+
+// получение userId и socket_connection_token (/api/v1/user/oauth) :contentReference[oaicite:3]{index=3}
+async function fetchDaUserInfo() {
+  if (!daAccessToken) return null;
+
+  const resp = await axios.get(
+    "https://www.donationalerts.com/api/v1/user/oauth",
+    {
+      headers: {
+        Authorization: `Bearer ${daAccessToken}`,
+      },
+    }
+  );
+
+  const data = resp.data?.data || resp.data || {};
+  return data;
+}
+
+// По документации DonationAlerts сообщения канала содержат donation resource
+// "представленный так же, как в Donations Alerts List". Мы не полагаемся на
+// конкретную обёртку Centrifugo, а рекурсивно ищем объект, у которого есть
+// поля id, message, amount, currency. :contentReference[oaicite:4]{index=4}
+function findDonationObject(node) {
+  if (!node || typeof node !== "object") return null;
+
+  const hasRequiredFields =
+    Object.prototype.hasOwnProperty.call(node, "id") &&
+    Object.prototype.hasOwnProperty.call(node, "message") &&
+    Object.prototype.hasOwnProperty.call(node, "amount") &&
+    Object.prototype.hasOwnProperty.call(node, "currency");
+
+  if (hasRequiredFields) {
+    return node;
   }
 
-  const amount = order.amount;
-  const receiver = YOOMONEY_WALLET;
-  const successUrl = `${RENDER_URL}/paid?order=${encodeURIComponent(orderId)}`;
+  for (const key of Object.keys(node)) {
+    const value = node[key];
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const found = findDonationObject(item);
+        if (found) return found;
+      }
+    } else if (value && typeof value === "object") {
+      const found = findDonationObject(value);
+      if (found) return found;
+    }
+  }
 
-  // Формируем HTML-страницу с автоотправкой формы в YooMoney QuickPay
-  res.send(`
-    <html>
-      <head>
-        <meta charset="utf-8" />
-        <title>Оплата через YooMoney</title>
-      </head>
-      <body style="font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">
-        <h2>Оплата баланса бота</h2>
-        <p>Сейчас вы будете перенаправлены на страницу оплаты YooMoney.</p>
-        <p>Сумма: <b>${amount} ₽</b></p>
-        <p>Ничего не меняйте на странице YooMoney — все поля уже заполнены.</p>
-        <form id="payForm" method="POST" action="https://yoomoney.ru/quickpay/confirm">
-          <input type="hidden" name="receiver" value="${receiver}" />
-          <input type="hidden" name="sum" value="${amount}" />
-          <input type="hidden" name="quickpay-form" value="shop" />
-          <input type="hidden" name="paymentType" value="AC" />
-          <input type="hidden" name="label" value="${orderId}" />
-          <input type="hidden" name="targets" value="Оплата публикаций в боте (заказ ${orderId})" />
-          <input type="hidden" name="successURL" value="${successUrl}" />
-          <noscript>
-            <button type="submit">Перейти к оплате</button>
-          </noscript>
-        </form>
-        <script>
-          setTimeout(function () {
-            document.getElementById("payForm").submit();
-          }, 300);
-        </script>
-      </body>
-    </html>
-  `);
-});
+  return null;
+}
 
-// Страница после успешной оплаты в YooMoney (чисто информационная)
-app.get("/paid", (req, res) => {
-  const orderId = String(req.query.order || "").trim();
-  res.send(`
-    <html>
-      <head><meta charset="utf-8" /><title>Оплата принята</title></head>
-      <body style="font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">
-        <h2>Спасибо!</h2>
-        <p>Если платёж прошёл успешно, бот автоматически зафиксирует его в течение 10–30 секунд.</p>
-        <p>Теперь можно вернуться в Telegram-бот и проверить баланс командой <b>/balance</b>.</p>
-        ${
-          orderId
-            ? `<p>Номер Вашего заказа: <b>${orderId}</b></p>`
-            : ""
-        }
-      </body>
-    </html>
-  `);
-});
+function extractDonationFromWsMessage(msg) {
+  return findDonationObject(msg);
+}
 
-// Периодический опрос YooMoney API по operation-history
-async function pollYooMoneyPayments() {
-  if (!YOOMONEY_ACCESS_TOKEN) {
+async function handleDonation(donation) {
+  if (!ordersCol || !usersCol) return;
+
+  const msg = donation.message || "";
+
+  const match = msg.match(/ORDER_([a-zA-Z0-9]+)/);
+  if (!match) return;
+
+  const orderId = match[1];
+
+  const order = await ordersCol.findOne({
+    orderId,
+    status: "pending",
+  });
+
+  if (!order) return;
+
+  let amountRub = parseFloat(donation.amount);
+  if (!Number.isFinite(amountRub) || amountRub <= 0) {
+    amountRub = order.amount;
+  }
+
+  const user = await updateUserBalance(order.tgId, amountRub);
+
+  await ordersCol.updateOne(
+    { _id: order._id },
+    {
+      $set: {
+        status: "paid",
+        paidAt: new Date(),
+        realAmount: amountRub,
+        donationId: donation.id,
+      },
+    }
+  );
+
+  if (user) {
+    try {
+      await bot.sendMessage(
+        order.tgId,
+        `Оплата ${amountRub} ₽ получена. Ваш новый баланс: ${Math.round(
+          user.balance
+        )} ₽.`
+      );
+    } catch (err) {
+      console.error(
+        "Не удалось отправить уведомление пользователю:",
+        err.message
+      );
+    }
+  }
+}
+
+// запуск WebSocket-подключения к DonationAlerts (Centrifugo) :contentReference[oaicite:5]{index=5}
+async function startDonationAlertsRealtime() {
+  if (!DA_CLIENT_ID || !DA_CLIENT_SECRET) {
     console.log(
-      "YOOMONEY_ACCESS_TOKEN не задан. Автоучёт оплат через YooMoney отключён."
+      "DA_CLIENT_ID или DA_CLIENT_SECRET не заданы. Автоучёт оплат DonationAlerts отключён."
     );
     return;
   }
-  if (!ordersCol || !usersCol) return;
+  if (!daAccessToken) {
+    console.log(
+      "DA OAuth ещё не выполнен. Для подключения DonationAlerts нажмите кнопку «Авторизовать DonationAlerts» в боте."
+    );
+    return;
+  }
+
+  const ok = await ensureDaAccessToken();
+  if (!ok) return;
 
   try {
-    const pendingOrders = await ordersCol
-      .find({ status: "pending", provider: "yoomoney" })
-      .toArray();
+    const userInfo = await fetchDaUserInfo();
+    if (!userInfo) {
+      console.error("DA: не удалось получить user info.");
+      return;
+    }
 
-    if (!pendingOrders.length) return;
+    daUserId = userInfo.id;
+    const socketToken = userInfo.socket_connection_token;
 
-    for (const order of pendingOrders) {
+    if (!daUserId || !socketToken) {
+      console.error(
+        "DA: userId или socket_connection_token отсутствуют в ответе."
+      );
+      return;
+    }
+
+    await saveDaTokensToDb(); // сохраним userId
+
+    const wsUrl = "wss://centrifugo.donationalerts.com/connection/websocket";
+
+    if (daWs) {
       try {
-        const params = new URLSearchParams();
-        // Фильтруем по label = orderId — YooMoney вернёт операции с этим label
-        params.set("label", order.orderId);
-        params.set("records", "10");
+        daWs.close();
+      } catch {}
+      daWs = null;
+    }
 
-        const resp = await axios.post(
-          "https://yoomoney.ru/api/operation-history",
-          params.toString(),
-          {
-            headers: {
-              Authorization: `Bearer ${YOOMONEY_ACCESS_TOKEN}`,
-              "Content-Type": "application/x-www-form-urlencoded",
-            },
-          }
-        );
+    console.log("Подключаемся к DonationAlerts WebSocket...");
+    daWs = new WebSocket(wsUrl);
 
-        const data = resp.data || {};
-        const operations = data.operations || [];
+    daWs.on("open", () => {
+      try {
+        const connectMsg = {
+          params: { token: socketToken },
+          id: 1,
+        };
+        daWs.send(JSON.stringify(connectMsg));
+      } catch (e) {
+        console.error("Ошибка отправки connectMsg в DA WebSocket:", e.message);
+      }
+    });
 
-        const op = operations.find(
-          (o) => o.status === "success" || o.status === "completed"
-        );
+    daWs.on("message", async (raw) => {
+      let msg;
+      try {
+        msg = JSON.parse(raw);
+      } catch {
+        return;
+      }
 
-        if (!op) {
-          continue; // оплата по этому заказу ещё не найдена
-        }
-
-        const amountPaid = parseFloat(op.amount);
-        if (!Number.isFinite(amountPaid) || amountPaid <= 0) {
-          continue;
-        }
-
-        // Отмечаем заказ как оплаченный
-        await ordersCol.updateOne(
-          { _id: order._id },
-          {
-            $set: {
-              status: "paid",
-              paidAt: new Date(),
-              realAmount: amountPaid,
-              providerOperationId: op.operation_id || op.operationId || null,
-            },
-          }
-        );
-
-        // Пополняем баланс пользователя
-        const user = await updateUserBalance(order.tgId, amountPaid);
+      // Ответ на connect (id=1) с client UUID
+      if (msg.id === 1 && msg.result && msg.result.client) {
+        daWsClientId = msg.result.client;
+        console.log("DA WebSocket: clientId =", daWsClientId);
 
         try {
-          await bot.sendMessage(
-            order.tgId,
-            `Платёж ${amountPaid} ₽ получен через YooMoney.\n` +
-              `Ваш новый баланс: ${Math.round(user.balance || 0)} ₽.\n\n` +
-              `Теперь вы можете публиковать стримы.`
+          // Запрашиваем токен для подписки на канал донатов
+          const resp = await axios.post(
+            "https://www.donationalerts.com/api/v1/centrifuge/subscribe",
+            {
+              channels: [`$alerts:donation_${daUserId}`],
+              client: daWsClientId,
+            },
+            {
+              headers: {
+                Authorization: `Bearer ${daAccessToken}`,
+                "Content-Type": "application/json",
+              },
+            }
           );
+
+          const arr = resp.data?.channels || [];
+          const ch = arr.find((c) =>
+            c.channel.includes(`$alerts:donation_${daUserId}`)
+          );
+          if (!ch) {
+            console.error("DA: не удалось получить channel token.");
+            return;
+          }
+
+          const subMsg = {
+            params: {
+              channel: ch.channel,
+              token: ch.token,
+            },
+            method: 1,
+            id: 2,
+          };
+          daWs.send(JSON.stringify(subMsg));
+          console.log("DA WebSocket: подписка на", ch.channel);
         } catch (err) {
           console.error(
-            "Не удалось отправить уведомление пользователю:",
-            err.message
+            "Ошибка подписки на DA канал:",
+            err.response?.data || err.message
           );
         }
-      } catch (err) {
-        console.error(
-          "Ошибка при опросе YooMoney для заказа",
-          order.orderId,
-          ":",
-          err.response?.data || err.message
-        );
+
+        return;
       }
-    }
+
+      // Подтверждение подписки (id=2) можно игнорировать
+      if (msg.id === 2) {
+        return;
+      }
+
+      // Остальные сообщения — потенциальные донаты
+      const donation = extractDonationFromWsMessage(msg);
+      if (donation) {
+        try {
+          await handleDonation(donation);
+        } catch (err) {
+          console.error("Ошибка в handleDonation:", err.message);
+        }
+      }
+    });
+
+    daWs.on("error", (err) => {
+      console.error("DA WebSocket error:", err.message);
+    });
+
+    daWs.on("close", () => {
+      console.log("DA WebSocket: соединение закрыто.");
+      scheduleDaReconnect();
+    });
   } catch (err) {
     console.error(
-      "Ошибка при общем опросе YooMoney:",
+      "Ошибка при инициализации DonationAlerts realtime:",
       err.response?.data || err.message
     );
+    scheduleDaReconnect();
   }
+}
+
+function scheduleDaReconnect(delayMs = 30000) {
+  if (daReconnectTimer) return;
+  daReconnectTimer = setTimeout(async () => {
+    daReconnectTimer = null;
+    console.log("Пытаемся переподключиться к DonationAlerts...");
+    await startDonationAlertsRealtime();
+  }, delayMs);
 }
 
 // ================== TELEGRAM: конфиг стримера ==================
 const streamerConfig = {}; // userId -> { channelId, donateName }
 
-// команда /donate <имя_на_DA или любой ник>
-// НУЖНА ТОЛЬКО ДЛЯ КНОПКИ ДОНАТА СТРИМЕРУ
+// команда /donate <имя_на_DA>
 bot.onText(/\/donate (.+)/, (msg, match) => {
   const userId = msg.from.id;
   const name = match[1].trim();
@@ -556,8 +779,7 @@ bot.onText(/\/donate (.+)/, (msg, match) => {
 
   bot.sendMessage(
     msg.chat.id,
-    `Кнопка доната будет вести на:\nhttps://www.donationalerts.com/r/${name}\n\n` +
-      "Мы эти платежи не обрабатываем — они идут напрямую вам."
+    `Донат успешно подключён:\nhttps://www.donationalerts.com/r/${name}`
   );
 });
 
@@ -600,20 +822,16 @@ bot.onText(/\/create\s+(\S+)\s+(\d+)/, async (msg, match) => {
 bot.onText(/\/start/, (msg) => {
   const text =
     "Добро пожаловать!\n\n" +
-    "Как работает бот:\n" +
-    "• Вы подключаете свой канал.\n" +
-    "• Отправляете сюда ссылку на стрим (Twitch / YouTube / VK).\n" +
-    `• За каждую публикацию стрима списывается ${PRICE_PER_POST} ₽ с внутреннего баланса.\n\n` +
-    "Чтобы подключить канал:\n" +
-    "1. Добавьте бота в администраторы вашего канала.\n" +
+    "Чтобы подключить Ваш канал:\n" +
+    "1. Добавьте бота в администраторы канала.\n" +
     "2. Отправьте любое сообщение в канале.\n" +
     "3. Перешлите это сообщение сюда, в бот.\n\n" +
-    "Баланс можно пополнить через YooMoney (кнопка ниже) или промокодом.";
+    "После подключения Вы сможете отправлять ссылки на трансляции.\n\n" +
+    `Публикация стрима списывает с баланса ${PRICE_PER_POST} ₽. Баланс можно пополнить в боте.`;
 
   const keyboard = {
     inline_keyboard: [
-      [{ text: "Пополнить баланс", callback_data: "topup" }],
-      [{ text: "Ввести промокод", callback_data: "promo_enter" }],
+      [{ text: "Авторизовать DonationAlerts", callback_data: "da_auth" }],
     ],
   };
 
@@ -626,15 +844,12 @@ bot.onText(/\/balance/, async (msg) => {
   const user = await getOrCreateUser(userId);
   const bal = user.balance || 0;
 
-  const text =
-    `Ваш текущий баланс: ${Math.round(bal)} ₽.\n\n` +
-    "Чтобы пополнить баланс, используйте кнопку ниже.\n" +
-    "После оплаты через YooMoney бот автоматически зафиксирует платёж в течение 10–30 секунд.";
+  const text = `Ваш текущий баланс: ${Math.round(bal)} ₽.`;
 
   const keyboard = {
     inline_keyboard: [
       [{ text: "Пополнить баланс", callback_data: "topup" }],
-      [{ text: "Ввести промокод", callback_data: "promo_enter" }],
+      [{ text: "Авторизовать DonationAlerts", callback_data: "da_auth" }],
     ],
   };
 
@@ -652,16 +867,13 @@ bot.on("callback_query", async (query) => {
   try {
     if (data === "topup") {
       const text =
-        "Выберите сумму пополнения.\n\n" +
-        "После нажатия откроется страница оплаты YooMoney.\n" +
-        "Важно: ничего не меняйте на странице YooMoney — все поля уже заполнены.\n" +
-        "После успешной оплаты баланс обновится автоматически (10–30 секунд).";
+        "Выберите сумму пополнения. После оплаты баланс будет пополнен автоматически:";
 
       const keyboard = {
         inline_keyboard: [
           [
             { text: "100 ₽", callback_data: "pay_100" },
-            { text: "200 ₽", callback_data: "pay_200" },
+            { text: "300 ₽", callback_data: "pay_300" },
           ],
           [
             { text: "500 ₽", callback_data: "pay_500" },
@@ -687,20 +899,17 @@ bot.on("callback_query", async (query) => {
             "Сейчас пополнение баланса недоступно (ошибка базы данных). Попробуйте позже."
           );
         } else {
-          const payUrl = `${RENDER_URL}/pay?order=${encodeURIComponent(
-            orderId
-          )}`;
+          const payUrl = buildDonateUrl(orderId, amount);
           const txt =
-            `Для пополнения баланса на ${amount} ₽ откроется страница оплаты YooMoney.\n\n` +
-            `Важно: ничего не меняйте на странице оплаты — комментарий и поля уже заполнены.\n` +
-            `После успешной оплаты бот автоматически зафиксирует платёж в течение 10–30 секунд.`;
+            `Для пополнения баланса на ${amount} ₽ перейдите по ссылке ниже и завершите оплату.\n\n` +
+            `Публикации будут начислены автоматически после подтверждения платежа DonationAlerts.`;
 
           await bot.sendMessage(chatId, txt, {
             reply_markup: {
               inline_keyboard: [
                 [
                   {
-                    text: "Перейти к оплате",
+                    text: "Оплатить через DonationAlerts",
                     url: payUrl,
                   },
                 ],
@@ -715,6 +924,41 @@ bot.on("callback_query", async (query) => {
         chatId,
         "Отправьте промокод одним сообщением (например: VOLNA100)."
       );
+    } else if (data === "da_auth") {
+      if (userId !== ADMIN_TG_ID) {
+        await bot.sendMessage(
+          chatId,
+          "Авторизовать DonationAlerts может только владелец бота."
+        );
+      } else {
+        if (!DA_CLIENT_ID || !DA_CLIENT_SECRET) {
+          await bot.sendMessage(
+            chatId,
+            "Переменные DA_CLIENT_ID и DA_CLIENT_SECRET не заданы на сервере."
+          );
+        } else {
+          const redirectUri = `${RENDER_URL}${DA_REDIRECT_PATH}`;
+          const scope = DA_SCOPES;
+          const authUrl =
+            "https://www.donationalerts.com/oauth/authorize" +
+            `?client_id=${encodeURIComponent(DA_CLIENT_ID)}` +
+            `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+            `&response_type=code` +
+            `&scope=${encodeURIComponent(scope)}`;
+
+          await bot.sendMessage(
+            chatId,
+            "Нажмите кнопку ниже, чтобы авторизовать DonationAlerts и включить автоматическое пополнение баланса:",
+            {
+              reply_markup: {
+                inline_keyboard: [
+                  [{ text: "Авторизовать DonationAlerts", url: authUrl }],
+                ],
+              },
+            }
+          );
+        }
+      }
     }
   } catch (err) {
     console.error("Ошибка в callback_query:", err.message);
@@ -755,7 +999,7 @@ bot.on("message", async (msg) => {
       return bot.sendMessage(
         msg.chat.id,
         `Канал успешно подключён: ${msg.forward_from_chat.title}\n\n` +
-          "Теперь вы можете отправить ссылку на стрим (Twitch / YouTube / VK)."
+          "Теперь Вы можете отправить ссылку на стрим."
       );
     }
 
@@ -770,12 +1014,12 @@ bot.on("message", async (msg) => {
     if (!cfg || !cfg.channelId) {
       return bot.sendMessage(
         msg.chat.id,
-        "Перед публикацией стрима необходимо подключить ваш канал.\n\n" +
+        "Перед публикацией стрима необходимо подключить Ваш канал.\n\n" +
           "Пожалуйста, выполните следующие шаги:\n" +
-          "1. Добавьте бота администраторами вашего канала.\n" +
+          "1. Добавьте бота администраторами Вашего канала.\n" +
           "2. Отправьте любое сообщение в канале.\n" +
           "3. Перешлите это сообщение сюда.\n\n" +
-          "После подключения вы сможете размещать ссылки на трансляции."
+          "После подключения Вы сможете размещать ссылки на трансляции."
       );
     }
 
@@ -799,7 +1043,7 @@ bot.on("message", async (msg) => {
     bot.sendMessage(
       msg.chat.id,
       `Готово! Публикация успешно размещена.\n` +
-        `С вашего баланса списано ${PRICE_PER_POST} ₽.\n` +
+        `С Вашего баланса списано ${PRICE_PER_POST} ₽.\n` +
         `Текущий баланс: ${Math.round(bal)} ₽.`
     );
   } catch (err) {
@@ -807,16 +1051,42 @@ bot.on("message", async (msg) => {
   }
 });
 
+// ================== OAuth callback DonationAlerts ==================
+app.get(DA_REDIRECT_PATH, async (req, res) => {
+  const code = req.query.code;
+  if (!code) {
+    return res.status(400).send("Не передан параметр code.");
+  }
+
+  try {
+    await exchangeCodeForToken(String(code));
+    await startDonationAlertsRealtime();
+    res.send(
+      "DonationAlerts успешно авторизован. Можете вернуться в Telegram-бот."
+    );
+  } catch (err) {
+    console.error(
+      "Ошибка в обработчике DA OAuth:",
+      err.response?.data || err.message
+    );
+    res
+      .status(500)
+      .send("Произошла ошибка при авторизации DonationAlerts. Попробуйте позже.");
+  }
+});
+
 // ================== СТАРТ СЕРВЕРА ==================
 async function start() {
   await initMongo();
+  await loadDaTokensFromDb();
 
-  if (YOOMONEY_ACCESS_TOKEN) {
-    console.log("Запускаем опрос YooMoney каждые 15 секунд...");
-    setInterval(pollYooMoneyPayments, 15000);
+  if (daAccessToken) {
+    startDonationAlertsRealtime().catch((e) =>
+      console.error("Ошибка старта DA realtime:", e.message)
+    );
   } else {
     console.log(
-      "YOOMONEY_ACCESS_TOKEN не задан. Автоучёт оплат через YooMoney отключён."
+      "DA OAuth токены не найдены. Нажмите в боте кнопку «Авторизовать DonationAlerts», чтобы включить автоучёт оплат."
     );
   }
 
