@@ -10,18 +10,26 @@ const PORT = process.env.PORT || 10000;
 
 const MONGODB_URI = process.env.MONGODB_URI;
 
-// Куда ведём стримера платить (dalink.to или прямая ссылка на форму DA)
-const DA_DONATE_URL =
-  process.env.DA_DONATE_URL || "https://dalink.to/mystreambot";
-
-// Личный (Personal) токен DonationAlerts для REST API
-const PERSONAL_DA_TOKEN = process.env.PERSONAL_DA_TOKEN || null;
-
 // Стоимость одной публикации
 const PRICE_PER_POST = parseInt(process.env.PRICE_PER_POST || "100", 10);
 
-// Админ для создания промокодов
+// Админ (для промокодов и обслуживания)
 const ADMIN_TG_ID = 618072923;
+
+// ---- YooMoney ----
+// client_id приложения (тот длинный код на скрине)
+const YOOMONEY_CLIENT_ID = process.env.YOOMONEY_CLIENT_ID;
+// номер кошелька, например 4100119418762211
+const YOOMONEY_WALLET = process.env.YOOMONEY_WALLET;
+
+// путь редиректа, он ДОЛЖЕН совпадать с Redirect URI в приложении
+const YOOMONEY_REDIRECT_PATH = "/yoomoney-oauth";
+// страница запуска авторизации (мы её сами придумали, в приложении не нужна)
+const YOOMONEY_AUTH_PATH = "/yoomoney-auth";
+
+// как часто опрашивать историю, мс (по умолчанию 10 секунд)
+const YOOMONEY_POLL_INTERVAL =
+  parseInt(process.env.YOOMONEY_POLL_INTERVAL || "10000", 10);
 
 // Определяем parent-домен (для Twitch)
 let PARENT_DOMAIN = "localhost";
@@ -77,8 +85,7 @@ app.get("/webapp", (req, res) => {
 function extractYouTubeId(url) {
   try {
     if (url.includes("watch?v=")) return url.split("v=")[1].split("&")[0];
-    if (url.includes("youtu.be/"))
-      return url.split("youtu.be/")[1].split("?")[0];
+    if (url.includes("youtu.be/")) return url.split("youtu.be/")[1].split("?")[0];
   } catch {}
   return null;
 }
@@ -188,6 +195,7 @@ let db;
 let usersCol;
 let ordersCol;
 let promoCol;
+let settingsCol;
 
 async function initMongo() {
   if (!MONGODB_URI) {
@@ -203,6 +211,7 @@ async function initMongo() {
     usersCol = db.collection("users");
     ordersCol = db.collection("orders");
     promoCol = db.collection("promocodes");
+    settingsCol = db.collection("settings");
     console.log("MongoDB подключен");
   } catch (err) {
     console.error("Ошибка подключения к MongoDB:", err.message);
@@ -303,7 +312,7 @@ async function applyPromocode(tgId, code) {
   };
 }
 
-// ================== ЗАКАЗЫ (через DonationAlerts) ==================
+// ================== ЗАКАЗЫ (через YooMoney) ==================
 function generateOrderId() {
   return Math.random().toString(36).slice(2, 10);
 }
@@ -322,18 +331,27 @@ async function createOrder(tgId, amount) {
   return orderId;
 }
 
-function buildDonateUrl(orderId, amount) {
+// Ссылка на оплату через YooMoney QuickPay
+function buildYooMoneyPayUrl(orderId, amount) {
   const params = new URLSearchParams();
-  params.set("amount", String(amount));
-  params.set("message", `ORDER_${orderId}`);
-  // DA_DONATE_URL — это либо dalink.to/mystreambot, либо прямая ссылка на форму
-  return `${DA_DONATE_URL}?${params.toString()}`;
+  params.set("receiver", YOOMONEY_WALLET);
+  params.set("quickpay-form", "donate");
+  params.set("sum", String(amount));
+  params.set("label", `ORDER_${orderId}`);
+  params.set(
+    "targets",
+    `Пополнение баланса в MyStreamingBot (ORDER_${orderId})`
+  );
+  params.set("paymentType", "AC"); // карта; можно PC для кошелька
+  if (RENDER_URL) {
+    params.set("successURL", RENDER_URL);
+  }
+  return `https://yoomoney.ru/quickpay/confirm.xml?${params.toString()}`;
 }
 
 // Проверка баланса перед постом
 async function ensureBalanceForPost(tgId, chatId) {
-  // если нет Mongo — не блокируем
-  if (!usersCol) return true;
+  if (!usersCol) return true; // если нет Mongo — не блокируем
 
   const user = await getOrCreateUser(tgId);
   const currentBalance = user.balance || 0;
@@ -345,7 +363,7 @@ async function ensureBalanceForPost(tgId, chatId) {
   const text =
     `Для публикации стрима необходим баланс не менее ${PRICE_PER_POST} ₽.\n` +
     `Сейчас на Вашем счёте: ${Math.round(currentBalance)} ₽.\n\n` +
-    `Пожалуйста, пополните баланс, чтобы разместить пост или введите промокод.`;
+    `Пожалуйста, пополните баланс, чтобы разместить пост, или введите промокод.`;
 
   await bot.sendMessage(chatId, text, {
     reply_markup: {
@@ -364,111 +382,177 @@ async function chargeForPost(tgId) {
   await updateUserBalance(tgId, -PRICE_PER_POST);
 }
 
-// ================== DonationAlerts REST polling ==================
-async function handleDonation(donation) {
-  if (!ordersCol || !usersCol) return;
+// ================== YOOMONEY OAUTH + POLLING ==================
+// В памяти
+let ymAccessToken = null;
+let ymTokenExpiresAt = null;
+let ymLastHistoryTime = null; // Date
 
-  const msg =
-    donation.message ||
-    donation.message_text ||
-    donation.text ||
-    donation.comment ||
-    "";
+async function loadYooMoneyStateFromDb() {
+  if (!settingsCol) return;
+  const doc = await settingsCol.findOne({ _id: "yoomoney_oauth" });
+  if (!doc) return;
 
-  const match = msg.match(/ORDER_([a-zA-Z0-9]+)/);
-  if (!match) return;
+  ymAccessToken = doc.accessToken || null;
+  ymTokenExpiresAt = doc.expiresAt ? new Date(doc.expiresAt) : null;
+  ymLastHistoryTime = doc.lastHistoryTime
+    ? new Date(doc.lastHistoryTime)
+    : null;
+}
 
-  const orderId = match[1];
-
-  const order = await ordersCol.findOne({
-    orderId,
-    status: "pending",
-  });
-
-  if (!order) return;
-
-  let amountRub = parseFloat(donation.amount);
-  if (!Number.isFinite(amountRub) || amountRub <= 0) {
-    amountRub = order.amount;
-  }
-
-  const user = await updateUserBalance(order.tgId, amountRub);
-
-  await ordersCol.updateOne(
-    { _id: order._id },
+async function saveYooMoneyStateToDb() {
+  if (!settingsCol) return;
+  await settingsCol.updateOne(
+    { _id: "yoomoney_oauth" },
     {
       $set: {
-        status: "paid",
-        paidAt: new Date(),
-        realAmount: amountRub,
-        donationId: donation.id,
+        accessToken: ymAccessToken,
+        expiresAt: ymTokenExpiresAt,
+        lastHistoryTime: ymLastHistoryTime,
+        updatedAt: new Date(),
       },
+    },
+    { upsert: true }
+  );
+}
+
+function hasValidYmToken() {
+  if (!ymAccessToken) return false;
+  if (!ymTokenExpiresAt) return true;
+  return ymTokenExpiresAt.getTime() > Date.now() + 60 * 1000;
+}
+
+// Получение access_token по коду
+async function exchangeCodeForYmToken(code) {
+  if (!YOOMONEY_CLIENT_ID) {
+    throw new Error("YOOMONEY_CLIENT_ID не задан.");
+  }
+
+  const redirectUri = `${RENDER_URL}${YOOMONEY_REDIRECT_PATH}`;
+
+  const body = new URLSearchParams();
+  body.set("code", code);
+  body.set("client_id", YOOMONEY_CLIENT_ID);
+  body.set("grant_type", "authorization_code");
+  body.set("redirect_uri", redirectUri);
+
+  const resp = await axios.post(
+    "https://yoomoney.ru/oauth/token",
+    body.toString(),
+    {
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
     }
   );
 
-  if (user) {
-    try {
-      await bot.sendMessage(
-        order.tgId,
-        `Оплата ${amountRub} ₽ получена. Ваш новый баланс: ${Math.round(
-          user.balance
-        )} ₽.\n\n` +
-          "Если оплата была через DonationAlerts, не меняйте комментарий к платежу — по нему бот привязывает перевод к вашему аккаунту."
-      );
-    } catch (err) {
-      console.error(
-        "Не удалось отправить уведомление пользователю:",
-        err.message
-      );
-    }
-  }
+  const data = resp.data || {};
+  ymAccessToken = data.access_token;
+  const expiresIn = data.expires_in ? Number(data.expires_in) : 0;
+  ymTokenExpiresAt = expiresIn
+    ? new Date(Date.now() + expiresIn * 1000)
+    : null;
+
+  await saveYooMoneyStateToDb();
 }
 
-async function startDonationAlertsPolling() {
-  if (!PERSONAL_DA_TOKEN) {
-    console.log(
-      "PERSONAL_DA_TOKEN не задан. Автоматический учёт оплат DonationAlerts отключён."
-    );
+// Опрос истории операций
+async function pollYooMoney() {
+  if (!hasValidYmToken()) {
     return;
   }
 
-  console.log("Запускаем опрос DonationAlerts каждые 15 секунд...");
+  try {
+    const params = new URLSearchParams();
+    // Нас интересуют зачисления
+    params.set("type", "deposition");
+    params.set("records", "50");
+    if (ymLastHistoryTime) {
+      params.set("from", ymLastHistoryTime.toISOString());
+    }
 
-  const poll = async () => {
-    try {
-      const resp = await axios.get(
-        "https://www.donationalerts.com/api/v1/alerts/donations",
+    const resp = await axios.get(
+      "https://yoomoney.ru/api/operation-history",
+      {
+        headers: {
+          Authorization: `Bearer ${ymAccessToken}`,
+        },
+        params,
+      }
+    );
+
+    const data = resp.data || {};
+    const ops = data.operations || [];
+
+    let maxDate = ymLastHistoryTime || new Date(0);
+
+    for (const op of ops) {
+      if (!op.datetime) continue;
+      const dt = new Date(op.datetime);
+      if (dt > maxDate) maxDate = dt;
+
+      const label = op.label || "";
+      const details = op.details || "";
+      const combined = `${label} ${details || ""}`;
+
+      const match = combined.match(/ORDER_([a-zA-Z0-9]+)/);
+      if (!match) continue;
+
+      const orderId = match[1];
+
+      if (!ordersCol || !usersCol) continue;
+
+      const order = await ordersCol.findOne({ orderId });
+      if (!order || order.status === "paid") continue;
+
+      let amount = Number(op.amount);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        amount = order.amount;
+      }
+
+      const user = await updateUserBalance(order.tgId, amount);
+
+      await ordersCol.updateOne(
+        { _id: order._id },
         {
-          headers: {
-            Authorization: `Bearer ${PERSONAL_DA_TOKEN}`,
-          },
-          params: {
-            limit: 50,
+          $set: {
+            status: "paid",
+            paidAt: new Date(),
+            realAmount: amount,
+            ymOperationId: op.operation_id,
           },
         }
       );
 
-      const list = resp.data?.data || [];
-      for (const d of list) {
-        await handleDonation(d);
+      if (user) {
+        try {
+          await bot.sendMessage(
+            order.tgId,
+            `Оплата ${amount} ₽ получена через YooMoney. Ваш новый баланс: ${Math.round(
+              user.balance
+            )} ₽.`
+          );
+        } catch (e) {
+          console.error(
+            "Не удалось отправить уведомление пользователю:",
+            e.message
+          );
+        }
       }
-    } catch (err) {
-      console.error(
-        "Ошибка при опросе DonationAlerts:",
-        err.response?.data || err.message
-      );
     }
-  };
 
-  // первый вызов сразу, потом — каждые 15 секунд
-  await poll();
-  setInterval(poll, 15000);
+    ymLastHistoryTime = maxDate;
+    await saveYooMoneyStateToDb();
+  } catch (err) {
+    console.error(
+      "Ошибка при опросе YooMoney:",
+      err.response?.data || err.message
+    );
+  }
 }
 
 // ================== TELEGRAM: конфиг стримера ==================
 const streamerConfig = {}; // userId -> { channelId, donateName }
 
-// команда /donate <имя_на_DA>
+// команда /donate <имя_на_DA> (для кнопки доната СТРИМЕРУ)
 bot.onText(/\/donate (.+)/, (msg, match) => {
   const userId = msg.from.id;
   const name = match[1].trim();
@@ -526,10 +610,16 @@ bot.onText(/\/start/, (msg) => {
     "2. Отправьте любое сообщение в канале.\n" +
     "3. Перешлите это сообщение сюда, в бот.\n\n" +
     "После подключения Вы сможете отправлять ссылки на трансляции.\n\n" +
-    `Публикация стрима списывает с баланса ${PRICE_PER_POST} ₽. Баланс можно пополнить в боте.\n\n` +
-    "Оплата идёт через DonationAlerts. Не меняйте комментарий к платежу — по нему бот поймёт, что это Ваш платёж. Начисление обычно занимает 10–20 секунд.";
+    `Публикация стрима списывает с баланса ${PRICE_PER_POST} ₽. Баланс можно пополнить через YooMoney.`;
 
-  bot.sendMessage(msg.chat.id, text);
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: "Пополнить баланс", callback_data: "topup" }],
+      [{ text: "Ввести промокод", callback_data: "promo_enter" }],
+    ],
+  };
+
+  bot.sendMessage(msg.chat.id, text, { reply_markup: keyboard });
 });
 
 // ================== /balance ==================
@@ -538,12 +628,13 @@ bot.onText(/\/balance/, async (msg) => {
   const user = await getOrCreateUser(userId);
   const bal = user.balance || 0;
 
-  const text =
-    `Ваш текущий баланс: ${Math.round(bal)} ₽.\n\n` +
-    "Пополняя баланс через DonationAlerts, не меняйте комментарий к платежу. Начисление обычно занимает 10–20 секунд.";
+  const text = `Ваш текущий баланс: ${Math.round(bal)} ₽.`;
 
   const keyboard = {
-    inline_keyboard: [[{ text: "Пополнить баланс", callback_data: "topup" }]],
+    inline_keyboard: [
+      [{ text: "Пополнить баланс", callback_data: "topup" }],
+      [{ text: "Ввести промокод", callback_data: "promo_enter" }],
+    ],
   };
 
   bot.sendMessage(msg.chat.id, text, { reply_markup: keyboard });
@@ -560,15 +651,14 @@ bot.on("callback_query", async (query) => {
   try {
     if (data === "topup") {
       const text =
-        "Выберите сумму пополнения. Оплата пройдёт через DonationAlerts.\n\n" +
-        "⚠️ Важно: не изменяйте комментарий к платежу — в нём будет служебное слово ORDER_xxx.\n" +
-        "После оплаты подождите 10–20 секунд, бот сам зачислит деньги и пришлёт уведомление.";
+        "Выберите сумму пополнения. После оплаты баланс будет пополнен автоматически в течение 10–20 секунд.\n\n" +
+        "Важно: не меняйте комментарий и поля на странице YooMoney.";
 
       const keyboard = {
         inline_keyboard: [
           [
             { text: "100 ₽", callback_data: "pay_100" },
-            { text: "300 ₽", callback_data: "pay_300" },
+            { text: "200 ₽", callback_data: "pay_200" },
           ],
           [
             { text: "500 ₽", callback_data: "pay_500" },
@@ -594,20 +684,18 @@ bot.on("callback_query", async (query) => {
             "Сейчас пополнение баланса недоступно (ошибка базы данных). Попробуйте позже."
           );
         } else {
-          const payUrl = buildDonateUrl(orderId, amount);
+          const payUrl = buildYooMoneyPayUrl(orderId, amount);
           const txt =
-            `Вы пополняете баланс на ${amount} ₽.\n\n` +
-            "1. Нажмите кнопку «Оплатить через DonationAlerts».\n" +
-            "2. На странице оплаты **не меняйте комментарий** — в нём уже будет служебное слово вида ORDER_xxx.\n" +
-            "3. После успешной оплаты просто вернитесь в бот. В течение 10–20 секунд деньги будут зачислены автоматически, и Вы получите уведомление.\n\n" +
-            "Если уведомление не пришло, проверьте, что комментарий к платежу не изменялся и совпадает с тем, что подставил бот.";
+            `Для пополнения баланса на ${amount} ₽ перейдите по ссылке ниже и завершите оплату.\n\n` +
+            `Оплата проводится через YooMoney. Баланс в боте пополнится автоматически, как только платёж будет подтверждён.\n\n` +
+            `Если оплата не отразилась в течение 1–2 минут, напишите администратору.`;
 
           await bot.sendMessage(chatId, txt, {
             reply_markup: {
               inline_keyboard: [
                 [
                   {
-                    text: "Оплатить через DonationAlerts",
+                    text: "Оплатить через YooMoney",
                     url: payUrl,
                   },
                 ],
@@ -634,7 +722,7 @@ bot.on("callback_query", async (query) => {
   }
 });
 
-// ================== ОБРАБОТКА сообщений (в т.ч. промокод и ссылки) ==================
+// ================== ОБРАБОТКА сообщений (в т.ч. промокод) ==================
 bot.on("message", async (msg) => {
   try {
     const text = msg.text || "";
@@ -714,10 +802,78 @@ bot.on("message", async (msg) => {
   }
 });
 
+// ================== YOOMONEY AUTH ROUTES ==================
+
+// Стартовая страница авторизации YooMoney.
+// Её нужно открыть ОДИН РАЗ в браузере, будучи залогиненным в кошелёк.
+app.get(YOOMONEY_AUTH_PATH, (req, res) => {
+  if (!YOOMONEY_CLIENT_ID || !RENDER_URL) {
+    return res
+      .status(500)
+      .send("YOOMONEY_CLIENT_ID или RENDER_EXTERNAL_URL не заданы.");
+  }
+
+  const redirectUri = `${RENDER_URL}${YOOMONEY_REDIRECT_PATH}`;
+  const scope = "account-info operation-history";
+
+  // Делаем form POST, как в документации YooMoney
+  res.send(`
+    <html>
+      <body>
+        <form id="f" method="post" action="https://yoomoney.ru/oauth/authorize">
+          <input type="hidden" name="client_id" value="${YOOMONEY_CLIENT_ID}" />
+          <input type="hidden" name="response_type" value="code" />
+          <input type="hidden" name="redirect_uri" value="${redirectUri}" />
+          <input type="hidden" name="scope" value="${scope}" />
+        </form>
+        <script>document.getElementById('f').submit();</script>
+      </body>
+    </html>
+  `);
+});
+
+// Redirect URI — сюда вернётся YooMoney с ?code=...
+app.get(YOOMONEY_REDIRECT_PATH, async (req, res) => {
+  const code = req.query.code;
+  if (!code) {
+    return res.status(400).send("Не передан параметр code.");
+  }
+
+  try {
+    await exchangeCodeForYmToken(String(code));
+    res.send(
+      "YooMoney успешно авторизован. Можете вернуться в Telegram-бот. Баланс будет пополняться автоматически."
+    );
+  } catch (err) {
+    console.error(
+      "Ошибка в обработчике YooMoney OAuth:",
+      err.response?.data || err.message
+    );
+    res
+      .status(500)
+      .send("Произошла ошибка при авторизации YooMoney. Попробуйте позже.");
+  }
+});
+
 // ================== СТАРТ СЕРВЕРА ==================
 async function start() {
   await initMongo();
-  await startDonationAlertsPolling(); // REST-опрос DA
+  await loadYooMoneyStateFromDb();
+
+  if (hasValidYmToken()) {
+    console.log("YooMoney OAuth токен найден, запускаем опрос истории.");
+  } else {
+    console.log(
+      `YooMoney токен не найден. После деплоя откройте ${RENDER_URL}${YOOMONEY_AUTH_PATH} в браузере, чтобы выдать доступ.`
+    );
+  }
+
+  if (YOOMONEY_POLL_INTERVAL > 0) {
+    setInterval(pollYooMoney, YOOMONEY_POLL_INTERVAL);
+    console.log(
+      `Запускаем опрос YooMoney каждые ${YOOMONEY_POLL_INTERVAL / 1000} секунд...`
+    );
+  }
 
   app.listen(PORT, () => console.log("SERVER RUNNING ON PORT", PORT));
 }
