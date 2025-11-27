@@ -12,6 +12,7 @@
     "express": "^4.19.2",
     "node-telegram-bot-api": "^0.63.0",
     "mongodb": "^6.7.0",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "donationalerts-api": "^1.0.5"
   }
 }
