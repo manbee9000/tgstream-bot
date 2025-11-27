@@ -137,7 +137,7 @@ function getEmbed(url) {
   if (url.includes("youtu")) {
     const id = extractYouTubeId(url);
     if (id) {
-      return `https://www.youtube-nocookie.com/embed/${id}?autoplay=1`;
+      return `https://www.youtube-nocookie.com/embed/${id}?autoplay=1&playsinline=1`;
     }
   }
 
