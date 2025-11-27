@@ -11,21 +11,16 @@ const PORT = process.env.PORT || 10000;
 
 const MONGODB_URI = process.env.MONGODB_URI;
 
-// DonationAlerts: страница доната для пополнения баланса бота
 const DA_DONATE_URL =
   process.env.DA_DONATE_URL || "https://dalink.to/mystreambot";
 
-// Widget token
 const DA_WIDGET_TOKEN = process.env.DA_WIDGET_TOKEN || null;
 
-// Стоимость одной публикации
 const PRICE_PER_POST = parseInt(process.env.PRICE_PER_POST || "100", 10);
 
-// OAuth DonationAlerts
 const DA_CLIENT_ID = process.env.DA_CLIENT_ID || null;
 const DA_CLIENT_SECRET = process.env.DA_CLIENT_SECRET || null;
 
-// Скоупы
 const DA_SCOPES =
   process.env.DA_SCOPES || "oauth-user-show oauth-donation-subscribe";
 
@@ -33,7 +28,6 @@ const DA_REDIRECT_PATH = process.env.DA_REDIRECT_PATH || "/da-oauth";
 
 const ADMIN_TG_ID = 618072923;
 
-// Определяем parent-домен (для Twitch)
 let PARENT_DOMAIN = "localhost";
 try {
   if (RENDER_URL) {
@@ -83,7 +77,7 @@ app.get("/webapp", (req, res) => {
   `);
 });
 
-// ================== HELPERS: YouTube/Twitch/VK ==================
+// ================== HELPERS ==================
 function extractYouTubeId(url) {
   try {
     if (url.includes("watch?v=")) return url.split("v=")[1].split("&")[0];
@@ -105,6 +99,7 @@ async function getThumbnail(url) {
   if (url.includes("youtu")) {
     const id = extractYouTubeId(url);
     if (!id) return null;
+
     return `https://i.ytimg.com/vi/${id}/maxresdefault.jpg`;
   }
 
@@ -271,7 +266,8 @@ async function createPromocode(code, postsCount, createdBy) {
 }
 
 async function applyPromocode(tgId, code) {
-  if (!promoCol || !usersCol) return { ok: false, message: "База недоступна" };
+  if (!promoCol || !usersCol)
+    return { ok: false, message: "База недоступна" };
 
   const normalized = code.trim().toUpperCase();
 
@@ -307,7 +303,6 @@ async function applyPromocode(tgId, code) {
       `Текущий баланс: ${Math.round(newBalance)} ₽.`,
   };
 }
-
 // ================== ЗАКАЗЫ ==================
 function generateOrderId() {
   return Math.random().toString(36).slice(2, 10);
@@ -328,7 +323,6 @@ async function createOrder(tgId, chatId, amount) {
   return orderId;
 }
 
-// Формируем URL + message
 function buildDonateUrl(orderId, amount) {
   const params = new URLSearchParams();
   params.set("message", `ORDER_${orderId}`);
@@ -336,21 +330,18 @@ function buildDonateUrl(orderId, amount) {
   return `${DA_DONATE_URL}?${params.toString()}`;
 }
 
-// Проверка баланса
 async function ensureBalanceForPost(tgId, chatId) {
   if (!usersCol) return true;
 
   const user = await getOrCreateUser(tgId);
   const currentBalance = user.balance || 0;
 
-  if (currentBalance >= PRICE_PER_POST) {
-    return true;
-  }
+  if (currentBalance >= PRICE_PER_POST) return true;
 
   const text =
     `Для публикации стрима необходим баланс не менее ${PRICE_PER_POST} ₽.\n` +
     `Сейчас на Вашем счёте: ${Math.round(currentBalance)} ₽.\n\n` +
-    `Пожалуйста, пополните баланс, чтобы разместить пост или введите промокод.`;
+    `Пожалуйста, пополните баланс или введите промокод.`;
 
   await bot.sendMessage(chatId, text, {
     reply_markup: {
@@ -445,8 +436,7 @@ async function ensureDaAccessToken() {
 
   const now = Date.now();
   const expiresInMs = daTokenExpiresAt.getTime() - now;
-
-  if (expiresInMs > 60 * 1000) return true;
+  if (expiresInMs > 60000) return true;
 
   if (!daRefreshToken) return true;
 
@@ -489,9 +479,7 @@ async function fetchDaUserInfo() {
   const resp = await axios.get(
     "https://www.donationalerts.com/api/v1/user/oauth",
     {
-      headers: {
-        Authorization: `Bearer ${daAccessToken}`,
-      },
+      headers: { Authorization: `Bearer ${daAccessToken}` },
     }
   );
 
@@ -502,24 +490,24 @@ async function fetchDaUserInfo() {
 function findDonationObject(node) {
   if (!node || typeof node !== "object") return null;
 
-  const hasRequired =
+  const has =
     node.hasOwnProperty("id") &&
     node.hasOwnProperty("message") &&
     node.hasOwnProperty("amount") &&
     node.hasOwnProperty("currency");
 
-  if (hasRequired) return node;
+  if (has) return node;
 
   for (const key of Object.keys(node)) {
-    const value = node[key];
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        const found = findDonationObject(item);
-        if (found) return found;
+    const val = node[key];
+    if (Array.isArray(val)) {
+      for (const item of val) {
+        const r = findDonationObject(item);
+        if (r) return r;
       }
-    } else if (value && typeof value === "object") {
-      const found = findDonationObject(value);
-      if (found) return found;
+    } else if (typeof val === "object" && val) {
+      const r = findDonationObject(val);
+      if (r) return r;
     }
   }
 
@@ -540,19 +528,17 @@ async function handleDonation(donation) {
   });
 
   const msg = donation.message || "";
-
   const match = msg.match(/ORDER_([a-zA-Z0-9]+)/);
   if (!match) return;
 
   const orderId = match[1];
-
   const order = await ordersCol.findOne({
     orderId,
     status: "pending",
   });
 
   if (!order) {
-    console.log("ORDER не найден или уже обработан:", orderId);
+    console.log("ORDER не найден или обработан:", orderId);
     return;
   }
 
@@ -580,30 +566,23 @@ async function handleDonation(donation) {
     try {
       await bot.sendMessage(
         notifyChatId,
-        `Оплата ${amountRub} ₽ получена. Ваш новый баланс: ${Math.round(
+        `Оплата ${amountRub} ₽ получена! Новый баланс: ${Math.round(
           user.balance
         )} ₽.`
       );
     } catch (err) {
-      console.error(
-        "Не удалось отправить уведомление пользователю:",
-        err.message
-      );
+      console.error("Ошибка уведомления пользователя:", err.message);
     }
   }
 }
 
 async function startDonationAlertsRealtime() {
   if (!DA_CLIENT_ID || !DA_CLIENT_SECRET) {
-    console.log(
-      "DA_CLIENT_ID или DA_CLIENT_SECRET не заданы. Автоучёт оплат отключён."
-    );
+    console.log("DA CLIENT_ID/SECRET не заданы — учёт отключён.");
     return;
   }
   if (!daAccessToken) {
-    console.log(
-      "DA OAuth ещё не выполнен. Нажмите «Авторизовать DonationAlerts»."
-    );
+    console.log("DA OAuth не выполнен. Используйте /da");
     return;
   }
 
@@ -613,15 +592,14 @@ async function startDonationAlertsRealtime() {
   try {
     const userInfo = await fetchDaUserInfo();
     if (!userInfo) {
-      console.error("DA: не удалось получить user info.");
+      console.error("DA: не удалось получить user info");
       return;
     }
 
     daUserId = userInfo.id;
     const socketToken = userInfo.socket_connection_token;
-
     if (!daUserId || !socketToken) {
-      console.error("DA: не хватает userId или socket_connection_token");
+      console.error("DA: нет userId или WS-токена");
       return;
     }
 
@@ -633,22 +611,18 @@ async function startDonationAlertsRealtime() {
       try {
         daWs.close();
       } catch {}
-      daWs = null;
     }
 
-    console.log("Подключаемся к DA WebSocket...");
+    console.log("Подключение к DA WebSocket…");
     daWs = new WebSocket(wsUrl);
 
     daWs.on("open", () => {
-      try {
-        const connectMsg = {
+      daWs.send(
+        JSON.stringify({
           params: { token: socketToken },
           id: 1,
-        };
-        daWs.send(JSON.stringify(connectMsg));
-      } catch (e) {
-        console.error("WS connect error:", e.message);
-      }
+        })
+      );
     });
 
     daWs.on("message", async (raw) => {
@@ -661,7 +635,7 @@ async function startDonationAlertsRealtime() {
 
       if (msg.id === 1 && msg.result && msg.result.client) {
         daWsClientId = msg.result.client;
-        console.log("DA WebSocket: clientId =", daWsClientId);
+        console.log("DA clientId =", daWsClientId);
 
         try {
           const resp = await axios.post(
@@ -683,20 +657,19 @@ async function startDonationAlertsRealtime() {
             c.channel.includes(`$alerts:donation_${daUserId}`)
           );
           if (!ch) {
-            console.error("DA: не удалось получить channel token");
+            console.error("Нет channel token");
             return;
           }
 
-          const subMsg = {
-            params: {
-              channel: ch.channel,
-              token: ch.token,
-            },
-            method: 1,
-            id: 2,
-          };
-          daWs.send(JSON.stringify(subMsg));
-          console.log("DA WebSocket: подписка на", ch.channel);
+          daWs.send(
+            JSON.stringify({
+              params: { channel: ch.channel, token: ch.token },
+              method: 1,
+              id: 2,
+            })
+          );
+
+          console.log("Подписка:", ch.channel);
         } catch (err) {
           console.error("Ошибка подписки:", err.response?.data || err.message);
         }
@@ -707,39 +680,32 @@ async function startDonationAlertsRealtime() {
       if (msg.id === 2) return;
 
       const donation = extractDonationFromWsMessage(msg);
-      if (donation) {
-        try {
-          await handleDonation(donation);
-        } catch (err) {
-          console.error("Ошибка обработки доната:", err.message);
-        }
-      }
-    });
-
-    daWs.on("error", (err) => {
-      console.error("DA WebSocket error:", err.message);
+      if (donation) await handleDonation(donation);
     });
 
     daWs.on("close", () => {
-      console.log("DA WebSocket: соединение закрыто.");
+      console.log("WS закрыт. Переподключение…");
       scheduleDaReconnect();
     });
+
+    daWs.on("error", (err) => {
+      console.error("DA WS ERROR:", err.message);
+    });
   } catch (err) {
-    console.error("DA realtime error:", err.response?.data || err.message);
+    console.error("Realtime error:", err.response?.data || err.message);
     scheduleDaReconnect();
   }
 }
 
 function scheduleDaReconnect(delayMs = 30000) {
   if (daReconnectTimer) return;
-  daReconnectTimer = setTimeout(async () => {
+  daReconnectTimer = setTimeout(() => {
     daReconnectTimer = null;
-    console.log("Переподключаемся к DonationAlerts...");
-    await startDonationAlertsRealtime();
+    startDonationAlertsRealtime();
   }, delayMs);
 }
 
-// ================== TELEGRAM: конфиг стримера ==================
+// ================== TELEGRAM ==================
 const streamerConfig = {};
 
 bot.onText(/\/donate (.+)/, (msg, match) => {
@@ -755,77 +721,95 @@ bot.onText(/\/donate (.+)/, (msg, match) => {
   );
 });
 
-// команда /create
+// /create
 bot.onText(/\/create\s+(\S+)\s+(\d+)/, async (msg, match) => {
-  const fromId = msg.from.id;
-  if (fromId !== ADMIN_TG_ID) {
-    return bot.sendMessage(
-      msg.chat.id,
-      "Команда /create доступна только администратору."
-    );
+  if (msg.from.id !== ADMIN_TG_ID) {
+    return bot.sendMessage(msg.chat.id, "Команда только для владельца.");
   }
 
   const code = match[1];
   const postsCount = parseInt(match[2], 10);
-
-  if (!postsCount || postsCount <= 0) {
-    return bot.sendMessage(
-      msg.chat.id,
-      "Укажите положительное количество бесплатных публикаций."
-    );
-  }
+  if (!postsCount || postsCount <= 0)
+    return bot.sendMessage(msg.chat.id, "Укажите положительное число.");
 
   try {
-    await createPromocode(code, postsCount, fromId);
+    await createPromocode(code, postsCount, msg.from.id);
     bot.sendMessage(
       msg.chat.id,
-      `Промокод «${code}» создан.\nКоличество бесплатных публикаций: ${postsCount}.`
+      `Промокод «${code}» создан. Доступно публикаций: ${postsCount}.`
     );
   } catch (err) {
-    console.error("Ошибка создания промокода:", err.message);
-    bot.sendMessage(msg.chat.id, "Не удалось создать промокод. Попробуйте позже.");
+    console.error("Ошибка create:", err.message);
+    bot.sendMessage(msg.chat.id, "Ошибка БД.");
   }
 });
 
-// ================== /start ==================
+// ================== новая команда /da ==================
+bot.onText(/\/da/, async (msg) => {
+  if (msg.from.id !== ADMIN_TG_ID) {
+    return bot.sendMessage(msg.chat.id, "Команда доступна только владельцу.");
+  }
+
+  if (!DA_CLIENT_ID || !DA_CLIENT_SECRET) {
+    return bot.sendMessage(msg.chat.id, "DA CLIENT_ID/SECRET не заданы.");
+  }
+
+  const redirectUri = `${RENDER_URL}${DA_REDIRECT_PATH}`;
+  const scope = DA_SCOPES;
+
+  const authUrl =
+    "https://www.donationalerts.com/oauth/authorize" +
+    `?client_id=${encodeURIComponent(DA_CLIENT_ID)}` +
+    `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+    `&response_type=code` +
+    `&scope=${encodeURIComponent(scope)}`;
+
+  bot.sendMessage(
+    msg.chat.id,
+    "Нажмите кнопку ниже, чтобы авторизовать DonationAlerts:",
+    {
+      reply_markup: {
+        inline_keyboard: [[{ text: "Авторизовать DonationAlerts", url: authUrl }]],
+      },
+    }
+  );
+});
+
+// /start — убрали кнопку DA
 bot.onText(/\/start/, (msg) => {
   const text =
     "Добро пожаловать!\n\n" +
-    "Чтобы подключить Ваш канал:\n" +
+    "Чтобы подключить канал:\n" +
     "1. Добавьте бота в администраторы канала.\n" +
-    "2. Отправьте любое сообщение в канале.\n" +
-    "3. Перешлите это сообщение сюда, в бот.\n\n" +
-    "После подключения Вы сможете отправлять ссылки на трансляции.\n\n" +
-    `Публикация стрима списывает с баланса ${PRICE_PER_POST} ₽. Баланс можно пополнить в боте.`;
+    "2. Отправьте сообщение в канале.\n" +
+    "3. Перешлите его сюда.\n\n" +
+    `Стоимость публикации: ${PRICE_PER_POST} ₽. Баланс можно пополнить.`;
 
-  const keyboard = {
-    inline_keyboard: [
-      [{ text: "Авторизовать DonationAlerts", callback_data: "da_auth" }],
-    ],
-  };
-
-  bot.sendMessage(msg.chat.id, text, { reply_markup: keyboard });
+  bot.sendMessage(msg.chat.id, text);
 });
 
-// ================== /balance ==================
+// /balance — убрана кнопка DA
 bot.onText(/\/balance/, async (msg) => {
-  const userId = msg.from.id;
-  const user = await getOrCreateUser(userId);
+  const user = await getOrCreateUser(msg.from.id);
   const bal = user.balance || 0;
 
-  const text = `Ваш текущий баланс: ${Math.round(bal)} ₽.`;
-
-  const keyboard = {
-    inline_keyboard: [
-      [{ text: "Пополнить баланс", callback_data: "topup" }],
-      [{ text: "Авторизовать DonationAlerts", callback_data: "da_auth" }],
-    ],
-  };
-
-  bot.sendMessage(msg.chat.id, text, { reply_markup: keyboard });
+  bot.sendMessage(
+    msg.chat.id,
+    `Ваш баланс: ${Math.round(
+      bal
+    )} ₽.`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "Пополнить баланс", callback_data: "topup" }],
+          [{ text: "Ввести промокод", callback_data: "promo_enter" }],
+        ],
+      },
+    }
+  );
 });
 
-// ================== CALLBACK-ЗАПРОСЫ ==================
+// ================== CALLBACK ==================
 const promoWaitingUsers = new Set();
 
 bot.on("callback_query", async (query) => {
@@ -836,111 +820,59 @@ bot.on("callback_query", async (query) => {
   try {
     if (data === "topup") {
       const text =
-        "Выберите сумму пополнения. После оплаты баланс будет пополнен автоматически.\n\n" +
-        "**ВАЖНО:** на странице оплаты DonationAlerts необходимо вручную вставить ваш код `ORDER_xxxxx` в поле комментария к донату.\n" +
-        "НЕ меняйте и не удаляйте этот код, иначе бот не сможет привязать оплату!";
-
-      const keyboard = {
-        inline_keyboard: [
-          [
-            { text: "100 ₽", callback_data: "pay_100" },
-            { text: "300 ₽", callback_data: "pay_300" },
-          ],
-          [
-            { text: "500 ₽", callback_data: "pay_500" },
-            { text: "1000 ₽", callback_data: "pay_1000" },
-          ],
-          [{ text: "10000 ₽", callback_data: "pay_10000" }],
-        ],
-      };
+        "Выберите сумму. После оплаты баланс будет пополнён.\n\n" +
+        "**ВАЖНО:** вставьте код `ORDER_xxxxx` в комментарий на DonationAlerts.";
 
       await bot.sendMessage(chatId, text, {
-        reply_markup: keyboard,
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "100 ₽", callback_data: "pay_100" },
+              { text: "300 ₽", callback_data: "pay_300" },
+            ],
+            [
+              { text: "500 ₽", callback_data: "pay_500" },
+              { text: "1000 ₽", callback_data: "pay_1000" },
+            ],
+            [{ text: "10000 ₽", callback_data: "pay_10000" }],
+          ],
+        },
         parse_mode: "Markdown",
       });
-    } else if (data && data.startsWith("pay_")) {
+    }
+
+    else if (data.startsWith("pay_")) {
       const amount = parseInt(data.split("_")[1], 10);
+      if (!amount || amount <= 0)
+        return bot.sendMessage(chatId, "Неверная сумма.");
 
-      if (!amount || amount <= 0) {
-        await bot.sendMessage(
-          chatId,
-          "Не удалось определить сумму. Попробуйте ещё раз."
-        );
-      } else {
-        const orderId = await createOrder(userId, chatId, amount);
+      const orderId = await createOrder(userId, chatId, amount);
+      if (!orderId)
+        return bot.sendMessage(chatId, "Ошибка базы данных.");
 
-        if (!orderId) {
-          await bot.sendMessage(chatId, "Ошибка базы данных. Попробуйте позже.");
-        } else {
-          const payUrl = buildDonateUrl(orderId, amount);
+      const payUrl = buildDonateUrl(orderId, amount);
 
-          const txt =
-            `Для пополнения баланса на ${amount} ₽ перейдите по ссылке ниже и завершите оплату.\n\n` +
-            `Скопируйте ваш уникальный код и вставьте его в поле комментария на странице оплаты:\n\n` +
-            `\`ORDER_${orderId}\`\n\n` +
-            `Пожалуйста, НЕ меняйте его и не удаляйте, иначе бот не сможет засчитать оплату.\n\n` +
-            `Оплата проходит в течении 10 секунд, после оплаты скиньте ссылку на стрим боту снова.`;
+      const txt =
+        `Пополнение на ${amount} ₽.\n\n` +
+        `Скопируйте код и вставьте в комментарий:\n` +
+        `\`ORDER_${orderId}\`\n\n` +
+        `Затем нажмите «Оплатить».\n\n` +
+        `После оплаты просто отправьте ссылку на стрим ещё раз.`;
 
-          await bot.sendMessage(chatId, txt, {
-            reply_markup: {
-              inline_keyboard: [
-                [
-                  {
-                    text: "Оплатить через DonationAlerts",
-                    url: payUrl,
-                  },
-                ],
-              ],
-            },
-            parse_mode: "Markdown",
-          });
-        }
-      }
-    } else if (data === "promo_enter") {
+      await bot.sendMessage(chatId, txt, {
+        reply_markup: {
+          inline_keyboard: [[{ text: "Оплатить", url: payUrl }]],
+        },
+        parse_mode: "Markdown",
+      });
+    }
+
+    else if (data === "promo_enter") {
       promoWaitingUsers.add(userId);
-      await bot.sendMessage(
-        chatId,
-        "Отправьте промокод одним сообщением (например: PCHELA9000)."
-      );
-    } else if (data === "da_auth") {
-      if (userId !== ADMIN_TG_ID) {
-        await bot.sendMessage(
-          chatId,
-          "Авторизовать DonationAlerts может только владелец бота."
-        );
-      } else {
-        if (!DA_CLIENT_ID || !DA_CLIENT_SECRET) {
-          await bot.sendMessage(
-            chatId,
-            "На сервере не заданы переменные DA_CLIENT_ID и DA_CLIENT_SECRET."
-          );
-        } else {
-          const redirectUri = `${RENDER_URL}${DA_REDIRECT_PATH}`;
-          const scope = DA_SCOPES;
-
-          const authUrl =
-            "https://www.donationalerts.com/oauth/authorize" +
-            `?client_id=${encodeURIComponent(DA_CLIENT_ID)}` +
-            `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-            `&response_type=code` +
-            `&scope=${encodeURIComponent(scope)}`;
-
-          await bot.sendMessage(
-            chatId,
-            "Нажмите кнопку ниже, чтобы авторизовать DonationAlerts:",
-            {
-              reply_markup: {
-                inline_keyboard: [
-                  [{ text: "Авторизовать DonationAlerts", url: authUrl }],
-                ],
-              },
-            }
-          );
-        }
-      }
+      bot.sendMessage(chatId, "Введите промокод одним сообщением.");
     }
   } catch (err) {
-    console.error("Ошибка callback_query:", err.message);
+    console.error("callback:", err);
   } finally {
     try {
       await bot.answerCallbackQuery(id);
@@ -948,7 +880,7 @@ bot.on("callback_query", async (query) => {
   }
 });
 
-// ================== ОБРАБОТКА сообщений ==================
+// ================== MESSAGE HANDLER ==================
 bot.on("message", async (msg) => {
   try {
     const text = msg.text || "";
@@ -963,8 +895,7 @@ bot.on("message", async (msg) => {
       promoWaitingUsers.delete(userId);
       const code = text.trim();
       const res = await applyPromocode(userId, code);
-      await bot.sendMessage(msg.chat.id, res.message);
-      return;
+      return bot.sendMessage(msg.chat.id, res.message);
     }
 
     if (msg.forward_from_chat && msg.forward_from_chat.type === "channel") {
@@ -973,22 +904,18 @@ bot.on("message", async (msg) => {
 
       return bot.sendMessage(
         msg.chat.id,
-        `Канал успешно подключён: ${msg.forward_from_chat.title}\n\nТеперь Вы можете отправить ссылку на стрим.`
+        `Канал подключён: ${msg.forward_from_chat.title}.\nТеперь отправьте ссылку на стрим.`
       );
     }
 
     if (text.startsWith("/")) return;
-
     if (!text.startsWith("http://") && !text.startsWith("https://")) return;
 
     const cfg = streamerConfig[userId];
     if (!cfg || !cfg.channelId) {
       return bot.sendMessage(
         msg.chat.id,
-        "Перед публикацией необходимо подключить Ваш канал:\n\n" +
-          "1. Добавьте бота в администраторы канала.\n" +
-          "2. Выберете любое сообщение в вашем канале.\n" +
-          "3. Перешлите это сообщение сюда."
+        "Сначала подключите канал:\n1. Добавьте бота в админы.\n2. Перешлите сообщение из канала сюда."
       );
     }
 
@@ -999,41 +926,36 @@ bot.on("message", async (msg) => {
     const thumb = await getThumbnail(text);
 
     await publishStreamPost(cfg.channelId, embed, thumb, cfg.donateName);
-
     await chargeForPost(userId);
 
     const user = await getOrCreateUser(userId);
-    const bal = user.balance || 0;
-
     bot.sendMessage(
       msg.chat.id,
-      `Готово! Публикация размещена.\nС Вашего баланса списано ${PRICE_PER_POST} ₽.\nТекущий баланс: ${Math.round(
-        bal
+      `Готово! Списано ${PRICE_PER_POST} ₽.\nБаланс: ${Math.round(
+        user.balance
       )} ₽.`
     );
   } catch (err) {
-    console.error("MESSAGE ERROR:", err);
+    console.error("msg error:", err);
   }
 });
 
-// ================== OAuth callback DonationAlerts ==================
+// ================== OAUTH CALLBACK ==================
 app.get(DA_REDIRECT_PATH, async (req, res) => {
   const code = req.query.code;
-  if (!code) {
-    return res.status(400).send("Не передан параметр code.");
-  }
+  if (!code) return res.status(400).send("Нет параметра code.");
 
   try {
     await exchangeCodeForToken(String(code));
     await startDonationAlertsRealtime();
-    res.send("DonationAlerts успешно авторизован. Можете вернуться в Telegram-бот.");
+    res.send("DonationAlerts успешно авторизован!");
   } catch (err) {
     console.error("OAuth error:", err.response?.data || err.message);
-    res.status(500).send("Ошибка авторизации DonationAlerts. Попробуйте позже.");
+    res.status(500).send("Ошибка авторизации.");
   }
 });
 
-// ================== СТАРТ СЕРВЕРА ==================
+// ================== START ==================
 async function start() {
   await initMongo();
   await loadDaTokensFromDb();
@@ -1043,15 +965,13 @@ async function start() {
       console.error("Ошибка realtime:", e.message)
     );
   } else {
-    console.log(
-      "DA OAuth токены не найдены. Нажмите кнопку «Авторизовать DonationAlerts»."
-    );
+    console.log("DA OAuth не выполнен. Используйте /da");
   }
 
   app.listen(PORT, () => console.log("SERVER RUNNING ON PORT", PORT));
 }
 
 start().catch((err) => {
-  console.error("Fatal start error:", err);
+  console.error("Fatal:", err);
   process.exit(1);
 });
