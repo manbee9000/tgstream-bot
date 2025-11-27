@@ -105,7 +105,16 @@ async function getThumbnail(url) {
   if (url.includes("youtu")) {
     const id = extractYouTubeId(url);
     if (!id) return null;
-    return `https://i.ytimg.com/vi/${id}/maxresdefault.jpg`;
+
+    const max = `https://i.ytimg.com/vi/${id}/maxresdefault.jpg`;
+    const hq  = `https://i.ytimg.com/vi/${id}/hqdefault.jpg`;
+
+    try {
+      await axios.get(max, { timeout: 3000 });
+      return max;
+    } catch {
+      return hq;
+    }
   }
 
   if (url.includes("vk.com/video")) {
@@ -114,6 +123,7 @@ async function getThumbnail(url) {
 
   return null;
 }
+
 
 function getEmbed(url) {
   if (url.includes("twitch.tv")) {
