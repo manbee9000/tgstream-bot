@@ -940,7 +940,7 @@ bot.on("callback_query", async (query) => {
           const redirectUri = `${RENDER_URL}${DA_REDIRECT_PATH}`;
           const scope = DA_SCOPES;
           const authUrl =
-            "https://www.donationalerts.com/oauth/authorize" +
+            "https://www.donationalerts.com/oauth2/authorize" +
             `?client_id=${encodeURIComponent(DA_CLIENT_ID)}` +
             `&redirect_uri=${encodeURIComponent(redirectUri)}` +
             `&response_type=code` +
