@@ -11,8 +11,12 @@ const PORT = process.env.PORT || 10000;
 
 const MONGODB_URI = process.env.MONGODB_URI;
 
+// DonationAlerts: страница доната для пополнения баланса бота
 const DA_DONATE_URL =
   process.env.DA_DONATE_URL || "https://dalink.to/mystreambot";
+
+// Widget token (секрет виджета оповещений / статистики)
+const DA_WIDGET_TOKEN = process.env.DA_WIDGET_TOKEN || null;
 
 // Стоимость одной публикации
 const PRICE_PER_POST = parseInt(process.env.PRICE_PER_POST || "100", 10);
@@ -27,8 +31,8 @@ const DA_CLIENT_SECRET = process.env.DA_CLIENT_SECRET || null;
 const DA_SCOPES =
   process.env.DA_SCOPES || "oauth-user-show oauth-donation-subscribe";
 
-// Redirect-URL для OAuth (должен совпадать с тем, что в настройках DA)
-const DA_REDIRECT_PATH = "/da-oauth";
+// Redirect-URL для OAuth (берём из ENV, а если нет — по умолчанию /da-oauth)
+const DA_REDIRECT_PATH = process.env.DA_REDIRECT_PATH || "/da-oauth";
 
 // Админ для создания промокодов и авторизации DA
 const ADMIN_TG_ID = 618072923;
@@ -333,11 +337,8 @@ async function createOrder(tgId, amount) {
   return orderId;
 }
 
+// Формируем URL на страницу доната с уже проставленным комментарием ORDER_xxx
 function buildDonateUrl(orderId, amount) {
-  // Параметры формы доната не описаны в API, поэтому используем
-  // только документированные поля в самом донате (message).
-  // Здесь мы просто формируем URL с комментарием ORDER_<id>,
-  // который потом найдём в donation.message через WebSocket.
   const params = new URLSearchParams();
   params.set("message", `ORDER_${orderId}`);
   params.set("amount", String(amount));
@@ -419,7 +420,7 @@ async function saveDaTokensToDb() {
   );
 }
 
-// обмен code -> token (Authorization Code Grant) :contentReference[oaicite:1]{index=1}
+// обмен code -> token (Authorization Code Grant)
 async function exchangeCodeForToken(code) {
   if (!DA_CLIENT_ID || !DA_CLIENT_SECRET) {
     throw new Error("DA_CLIENT_ID или DA_CLIENT_SECRET не заданы.");
@@ -452,7 +453,7 @@ async function exchangeCodeForToken(code) {
   await saveDaTokensToDb();
 }
 
-// обновление токена по refresh_token при необходимости (обязательно с scope) :contentReference[oaicite:2]{index=2}
+// обновление токена по refresh_token при необходимости
 async function ensureDaAccessToken() {
   if (!daAccessToken) return false;
   if (!daTokenExpiresAt) return true;
@@ -498,7 +499,7 @@ async function ensureDaAccessToken() {
   }
 }
 
-// получение userId и socket_connection_token (/api/v1/user/oauth) :contentReference[oaicite:3]{index=3}
+// получение userId и socket_connection_token (/api/v1/user/oauth)
 async function fetchDaUserInfo() {
   if (!daAccessToken) return null;
 
@@ -516,9 +517,8 @@ async function fetchDaUserInfo() {
 }
 
 // По документации DonationAlerts сообщения канала содержат donation resource
-// "представленный так же, как в Donations Alerts List". Мы не полагаемся на
-// конкретную обёртку Centrifugo, а рекурсивно ищем объект, у которого есть
-// поля id, message, amount, currency. :contentReference[oaicite:4]{index=4}
+// "представленный так же, как в Donations Alerts List". Мы рекурсивно ищем
+// объект с полями id, message, amount, currency.
 function findDonationObject(node) {
   if (!node || typeof node !== "object") return null;
 
@@ -555,6 +555,12 @@ function extractDonationFromWsMessage(msg) {
 async function handleDonation(donation) {
   if (!ordersCol || !usersCol) return;
 
+  console.log("Получен донат от DA:", {
+    id: donation.id,
+    amount: donation.amount,
+    message: donation.message,
+  });
+
   const msg = donation.message || "";
 
   const match = msg.match(/ORDER_([a-zA-Z0-9]+)/);
@@ -567,7 +573,10 @@ async function handleDonation(donation) {
     status: "pending",
   });
 
-  if (!order) return;
+  if (!order) {
+    console.log("ORDER не найден или уже обработан:", orderId);
+    return;
+  }
 
   let amountRub = parseFloat(donation.amount);
   if (!Number.isFinite(amountRub) || amountRub <= 0) {
@@ -605,7 +614,7 @@ async function handleDonation(donation) {
   }
 }
 
-// запуск WebSocket-подключения к DonationAlerts (Centrifugo) :contentReference[oaicite:5]{index=5}
+// запуск WebSocket-подключения к DonationAlerts (Centrifugo)
 async function startDonationAlertsRealtime() {
   if (!DA_CLIENT_ID || !DA_CLIENT_SECRET) {
     console.log(
@@ -673,6 +682,9 @@ async function startDonationAlertsRealtime() {
       } catch {
         return;
       }
+
+      // Для отладки можно раскомментировать:
+      // console.log("DA WS RAW:", JSON.stringify(msg));
 
       // Ответ на connect (id=1) с client UUID
       if (msg.id === 1 && msg.result && msg.result.client) {
@@ -867,7 +879,9 @@ bot.on("callback_query", async (query) => {
   try {
     if (data === "topup") {
       const text =
-        "Выберите сумму пополнения. После оплаты баланс будет пополнен автоматически:";
+        "Выберите сумму пополнения. После оплаты баланс будет пополнен автоматически.\n\n" +
+        "Важно: на странице DonationAlerts комментарий к донату будет автоматически заполнен вида `ORDER_xxxxx`. " +
+        "НЕ меняйте и не удаляйте его, иначе бот не сможет привязать оплату к вашему заказу.";
 
       const keyboard = {
         inline_keyboard: [
@@ -902,6 +916,7 @@ bot.on("callback_query", async (query) => {
           const payUrl = buildDonateUrl(orderId, amount);
           const txt =
             `Для пополнения баланса на ${amount} ₽ перейдите по ссылке ниже и завершите оплату.\n\n` +
+            `Комментарий к донату уже будет заполнен как ORDER_${orderId} — пожалуйста, НЕ меняйте его, иначе бот не сможет засчитать оплату.\n\n` +
             `Публикации будут начислены автоматически после подтверждения платежа DonationAlerts.`;
 
           await bot.sendMessage(chatId, txt, {
