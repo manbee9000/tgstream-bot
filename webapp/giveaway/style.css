@@ -46,12 +46,13 @@ body {
   color: #ccc;
 }
 
-/* Стрелка */
 #arrow {
   position: absolute;
-  left: -45px;
-  top: 50%;
+  left: -60px;                /* выносим левее для красивого вида */
+  top: 50%;                   /* центр по вертикали */
   transform: translateY(-50%);
-  font-size: 40px;
-  color: #fff;
+  font-size: 60px;            /* увеличиваем размер стрелки */
+  font-weight: bold;
+  color: #ffffff;
+  text-shadow: 0 0 10px rgba(255,255,255,0.8);
 }
