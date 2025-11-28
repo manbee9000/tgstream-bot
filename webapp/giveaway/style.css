@@ -7,7 +7,18 @@ body {
   overflow: hidden;
 }
 
-/* Контейнер всей рулетки */
+/* СТРЕЛКА */
+#arrow {
+  position: absolute;
+  top: 50%;
+  left: calc(50% - 220px); /* 50% от ширины + смещение влево */
+  transform: translateY(-50%);
+  width: 60px;
+  height: 60px;
+  z-index: 10; /* всегда сверху */
+}
+
+/* КОНТЕЙНЕР РУЛЕТКИ */
 #roulette-container {
   position: absolute;
   top: 50%;
@@ -19,16 +30,16 @@ body {
   overflow: hidden;
 }
 
-/* Окно, в котором видна только часть списка */
+/* ОКНО ДЛЯ СПИСКА */
 #list-window {
-  position: relative;
   width: 100%;
   height: 100%;
-  overflow: hidden;
   background: #111;
+  overflow: hidden;
+  position: relative;
 }
 
-/* Сам список ников */
+/* САМ СПИСОК */
 #nickname-list {
   position: absolute;
   width: 100%;
@@ -36,21 +47,12 @@ body {
   left: 0;
 }
 
-/* Один ник */
+/* ОДИН НИК */
 .nickname {
   width: 100%;
   padding: 14px 0;
-  font-size: 20px;
   text-align: center;
-  border-bottom: 1px solid #222;
+  font-size: 20px;
   color: #ccc;
-}
-
-#arrow {
-  position: absolute;
-  left: -70px;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 60px;
-  height: 60px;
+  border-bottom: 1px solid #222;
 }
