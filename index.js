@@ -77,6 +77,8 @@ app.get("/webapp", (req, res) => {
   `);
 });
 
+app.use("/giveaway", express.static("webapp/giveaway"));
+
 // ================== HELPERS ==================
 function extractYouTubeId(url) {
   try {
