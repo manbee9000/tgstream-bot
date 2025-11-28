@@ -1,28 +1,57 @@
-// генерируем тестовые ники
-const nicknames = Array.from({ length: 50 }, (_, i) => "@user" + (i + 1));
-
-const list = document.getElementById("nickname-list");
-
-// добавляем ники в DOM
-nicknames.forEach(nick => {
-  const div = document.createElement("div");
-  div.className = "nickname";
-  div.textContent = nick;
-  list.appendChild(div);
-});
-
-// простая анимация
-let position = -300;
-
-function animate() {
-  position += 1;
-  list.style.top = position + "px";
-
-  if (position > 400) {
-    position = -300; // перезапуск
-  }
-
-  requestAnimationFrame(animate);
+body {
+  margin: 0;
+  padding: 0;
+  background: #000;
+  color: #fff;
+  font-family: sans-serif;
+  overflow: hidden;
 }
 
-animate();
+/* Контейнер всей рулетки */
+#roulette-container {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 300px;
+  height: 500px;
+  border: 1px solid #333;
+  overflow: hidden;
+}
+
+/* Окно, в котором видна только часть списка */
+#list-window {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #111;
+}
+
+/* Сам список ников */
+#nickname-list {
+  position: absolute;
+  width: 100%;
+  top: 0;
+  left: 0;
+}
+
+/* Один ник */
+.nickname {
+  width: 100%;
+  padding: 14px 0;
+  font-size: 20px;
+  text-align: center;
+  border-bottom: 1px solid #222;
+  color: #ccc;
+}
+
+/* Стрелка */
+#arrow {
+  position: absolute;
+  left: -45px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 40px;
+  color: #fff;
+}
