@@ -8,18 +8,24 @@
 </head>
 <body>
 
-  <!-- СТРЕЛКА СЛЕВА ОТ РУЛЕТКИ -->
+  <!-- Левая стрелка -->
   <div id="arrow">
-    <svg viewBox="0 0 100 100" width="60" height="60">
-      <polygon points="0,50 100,0 100,100" fill="white"/>
+    <svg viewBox="0 0 100 100" width="22" height="22">
+      <polygon points="0,0 100,50 0,100" fill="#B63538"/>
     </svg>
   </div>
 
-  <!-- КОНТЕЙНЕР РУЛЕТКИ -->
+  <!-- Рулетка -->
   <div id="roulette-container">
     <div id="list-window">
       <div id="nickname-list"></div>
     </div>
+  </div>
+
+  <!-- Таймер справа -->
+  <div id="timer-container">
+    <div id="timer-label">до окончания<br>розыгрыша</div>
+    <div id="timer-value">00:00:00</div>
   </div>
 
   <script src="script.js"></script>
