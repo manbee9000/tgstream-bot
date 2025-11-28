@@ -1,1 +1,1 @@
-<!-- placeholder -->
+console.log("Giveaway WebApp loaded");
