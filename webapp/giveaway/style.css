@@ -48,11 +48,9 @@ body {
 
 #arrow {
   position: absolute;
-  left: -60px;                /* выносим левее для красивого вида */
-  top: 50%;                   /* центр по вертикали */
+  left: -70px;
+  top: 50%;
   transform: translateY(-50%);
-  font-size: 60px;            /* увеличиваем размер стрелки */
-  font-weight: bold;
-  color: #ffffff;
-  text-shadow: 0 0 10px rgba(255,255,255,0.8);
+  width: 60px;
+  height: 60px;
 }
