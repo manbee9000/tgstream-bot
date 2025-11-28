@@ -1,15 +1,28 @@
-body {
-  margin: 0;
-  padding: 0;
-  background: #111;
-  color: #fff;
-  font-family: sans-serif;
+// генерируем тестовые ники
+const nicknames = Array.from({ length: 50 }, (_, i) => "@user" + (i + 1));
+
+const list = document.getElementById("nickname-list");
+
+// добавляем ники в DOM
+nicknames.forEach(nick => {
+  const div = document.createElement("div");
+  div.className = "nickname";
+  div.textContent = nick;
+  list.appendChild(div);
+});
+
+// простая анимация
+let position = -300;
+
+function animate() {
+  position += 1;
+  list.style.top = position + "px";
+
+  if (position > 400) {
+    position = -300; // перезапуск
+  }
+
+  requestAnimationFrame(animate);
 }
 
-.center {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  font-size: 24px;
-}
+animate();
