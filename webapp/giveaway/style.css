@@ -23,9 +23,9 @@ body {
   position: absolute;
   top: 50%;
   left: 50%;
-  transform: translate(-50%, -50%);
+  transform: translate(-50%, -55%);
   width: 280px;
-  height: 480px;
+  height: 360px;
   overflow: hidden;
 }
 
@@ -76,6 +76,28 @@ body {
 
 #timer-value {
   font-size: 18px;
-  font-weight: 500; /* Medium */
+  font-weight: 500;
   letter-spacing: 1px;
+}
+
+/* Кнопка участия */
+#join-btn {
+  position: absolute;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 260px;
+  padding: 12px 0;
+  border: none;
+  border-radius: 999px;
+  background: #B63538;
+  color: #FFFFFF;
+  font-size: 16px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+#join-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
