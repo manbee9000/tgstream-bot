@@ -1,6 +1,496 @@
 import express from "express";
 import TelegramBot from "node-telegram-bot-api";
 import axios from "axios";
+import { MongoClient, ObjectId } from "mongodb";
+import WebSocket from "ws";
+
+// ================== CONFIG ==================
+const TOKEN = process.env.BOT_TOKEN;
+const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
+const PORT = process.env.PORT || 10000;
+
+const MONGODB_URI = process.env.MONGODB_URI;
+
+const DA_DONATE_URL =
+  process.env.DA_DONATE_URL || "https://dalink.to/mystreambot";
+
+const DA_WIDGET_TOKEN = process.env.DA_WIDGET_TOKEN || null;
+
+const PRICE_PER_POST = parseInt(process.env.PRICE_PER_POST || "100", 10);
+
+const DA_CLIENT_ID = process.env.DA_CLIENT_ID || null;
+const DA_CLIENT_SECRET = process.env.DA_CLIENT_SECRET || null;
+
+const DA_SCOPES =
+  process.env.DA_SCOPES || "oauth-user-show oauth-donation-subscribe";
+
+const DA_REDIRECT_PATH = process.env.DA_REDIRECT_PATH || "/da-oauth";
+
+const ADMIN_TG_ID = 618072923;
+
+// ---- домен родителя для Twitch embed
+let PARENT_DOMAIN = "localhost";
+try {
+  if (RENDER_URL) {
+    PARENT_DOMAIN = new URL(RENDER_URL).host;
+  }
+} catch (e) {
+  console.error("Ошибка парсинга RENDER_URL:", e);
+}
+
+// ================== EXPRESS ==================
+const app = express();
+app.use(express.json());
+
+if (!TOKEN) {
+  console.error("Ошибка: BOT_TOKEN не задан!");
+  process.exit(1);
+}
+if (!RENDER_URL) {
+  console.error("Внимание: RENDER_EXTERNAL_URL не задан!");
+}
+
+// ================== TELEGRAM WEBHOOK ==================
+const bot = new TelegramBot(TOKEN, { webHook: true });
+bot.setWebHook(`${RENDER_URL}/webhook/${TOKEN}`);
+
+app.post(`/webhook/${TOKEN}`, (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
+});
+
+// ================== WEBAPP ДЛЯ iframe ==================
+app.get("/webapp", (req, res) => {
+  const src = req.query.src || "";
+  res.send(`
+    <html>
+      <body style="margin:0;background:#000">
+        <iframe
+          src="${src}"
+          allowfullscreen
+          allow="autoplay; encrypted-media; picture-in-picture"
+          style="width:100%;height:100%;border:0;"
+        ></iframe>
+      </body>
+    </html>
+  `);
+});
+
+// ====== выдача фронтенда рулетки
+app.use("/giveaway", express.static("webapp/giveaway"));
+
+// ================== HELPERS ==================
+function extractYouTubeId(url) {
+  try {
+    if (url.includes("watch?v=")) return url.split("v=")[1].split("&")[0];
+    if (url.includes("youtu.be/")) return url.split("youtu.be/")[1].split("?")[0];
+  } catch {}
+  return null;
+}
+
+async function getThumbnail(url) {
+  if (url.includes("twitch.tv")) {
+    try {
+      const name = url.split("/").pop().split("?")[0];
+      return `https://static-cdn.jtvnw.net/previews-ttv/live_user_${name}-1280x720.jpg`;
+    } catch {
+      return null;
+    }
+  }
+
+  if (url.includes("youtu")) {
+    const id = extractYouTubeId(url);
+    if (!id) return null;
+    return `https://i.ytimg.com/vi/${id}/maxresdefault.jpg`;
+  }
+
+  if (url.includes("vk.com/video")) return null;
+  return null;
+}
+
+function getEmbed(url) {
+  if (url.includes("twitch.tv")) {
+    try {
+      const name = url.split("/").pop().split("?")[0];
+      return `https://player.twitch.tv/?channel=${name}&parent=${PARENT_DOMAIN}`;
+    } catch {
+      return url;
+    }
+  }
+
+  if (url.includes("youtu")) {
+    const id = extractYouTubeId(url);
+    if (id) return `https://www.youtube-nocookie.com/embed/${id}?autoplay=1`;
+  }
+
+  if (url.includes("vk.com/video")) {
+    try {
+      const raw = url.split("video")[1];
+      const [oid, vid] = raw.split("_");
+      return `https://vk.com/video_ext.php?oid=${oid}&id=${vid}&hd=1`;
+    } catch {
+      return url;
+    }
+  }
+
+  return url;
+}
+
+// =========================================================
+// ================ MONGODB ================================
+// =========================================================
+let mongoClient;
+let db;
+let usersCol;
+let ordersCol;
+let promoCol;
+let settingsCol;
+let rafflesCol; // <<< новая коллекция розыгрышей
+
+async function initMongo() {
+  if (!MONGODB_URI) {
+    console.error("MONGODB_URI не задан, работа с БД отключена.");
+    return;
+  }
+  try {
+    mongoClient = new MongoClient(MONGODB_URI, {
+      serverSelectionTimeoutMS: 30000,
+    });
+    await mongoClient.connect();
+    db = mongoClient.db();
+
+    usersCol = db.collection("users");
+    ordersCol = db.collection("orders");
+    promoCol = db.collection("promocodes");
+    settingsCol = db.collection("settings");
+
+    // новая коллекция
+    rafflesCol = db.collection("raffles");
+
+    console.log("MongoDB подключен");
+  } catch (err) {
+    console.error("Ошибка подключения:", err.message);
+  }
+}
+
+// =========================================================
+// ============ ФУНКЦИИ ДЛЯ РОЗЫГРЫШЕЙ =====================
+// =========================================================
+
+// Создать черновик розыгрыша
+async function createDraftRaffle(ownerId) {
+  const doc = {
+    ownerId,
+    title: null,
+    imageUrl: null,
+    channelId: null,
+    requiredSubs: [],
+    startAt: null,
+    endAt: null,
+    participants: [],
+    status: "draft", // draft | active | finished
+    createdAt: new Date(),
+  };
+
+  const res = await rafflesCol.insertOne(doc);
+  return { ...doc, _id: res.insertedId };
+}
+
+// Обновить розыгрыш
+async function updateRaffle(id, update) {
+  await rafflesCol.updateOne(
+    { _id: new ObjectId(id) },
+    { $set: update }
+  );
+}
+
+// Получить текущий черновик
+async function getActiveDraft(ownerId) {
+  return rafflesCol.findOne({
+    ownerId,
+    status: "draft",
+  });
+}
+
+// Получить розыгрыш по id
+async function getRaffle(id) {
+  return rafflesCol.findOne({ _id: new ObjectId(id) });
+}
+
+// Добавить участника
+async function addParticipant(raffleId, nickname) {
+  await rafflesCol.updateOne(
+    { _id: new ObjectId(raffleId) },
+    { $addToSet: { participants: nickname } }
+  );
+}
+
+// ================== КНОПКА "Поддержать сервера" =============
+function supportKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: "❤️ Поддержать сервера бота",
+          url: DA_DONATE_URL,
+        },
+      ],
+    ],
+  };
+}
+
+// =========================================================
+// ===============   НОВАЯ КОМАНДА /giveaway   =============
+// =========================================================
+
+bot.onText(/\/giveaway/, async (msg) => {
+  const uid = msg.from.id;
+
+  // проверяем, есть ли черновик
+  let draft = await getActiveDraft(uid);
+  if (!draft) {
+    draft = await createDraftRaffle(uid);
+  }
+
+  await bot.sendMessage(
+    msg.chat.id,
+    "🎁 *Меню розыгрышей*\n\nВыберите действие:",
+    {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "📸 Загрузить картинку", callback_data: "raffle_image" }],
+          [{ text: "📝 Задать название", callback_data: "raffle_title" }],
+          [{ text: "🔗 Требуемые подписки", callback_data: "raffle_subs" }],
+          [{ text: "⏱ Время старта/конца", callback_data: "raffle_time" }],
+          [{ text: "📢 Опубликовать", callback_data: "raffle_publish" }],
+          [{ text: "❤️ Поддержать", url: DA_DONATE_URL }],
+        ],
+      },
+    }
+  );
+});
+// =========================================================
+// =============== CALLBACK QUERY ДЛЯ РОЗЫГРЫША ============
+// =========================================================
+
+const raffleWaitImage = new Set();
+const raffleWaitTitle = new Set();
+const raffleWaitSubs = new Set();
+const raffleWaitTime = new Set();
+
+bot.on("callback_query", async (query) => {
+  const { id, from, data, message } = query;
+  const uid = from.id;
+  const chatId = message.chat.id;
+
+  const draft = await getActiveDraft(uid);
+
+  try {
+    if (data === "raffle_image") {
+      raffleWaitImage.add(uid);
+      return bot.sendMessage(chatId, "Отправьте фото для розыгрыша одним сообщением.");
+    }
+
+    if (data === "raffle_title") {
+      raffleWaitTitle.add(uid);
+      return bot.sendMessage(chatId, "Введите название розыгрыша:");
+    }
+
+    if (data === "raffle_subs") {
+      raffleWaitSubs.add(uid);
+      return bot.sendMessage(
+        chatId,
+        "Введите через пробел @юзернеймы каналов, на которые нужно быть подписанным.\nНапример:\n`@volnaae @musicclub`\n\nЧтобы очистить список — отправьте `нет`.",
+        { parse_mode: "Markdown" }
+      );
+    }
+
+    if (data === "raffle_time") {
+      raffleWaitTime.add(uid);
+      return bot.sendMessage(
+        chatId,
+        "Введите время старта и конца в формате:\n\n`2025-01-01 12:00 | 2025-01-01 12:10`"
+      );
+    }
+
+    if (data === "raffle_publish") {
+      if (!draft) return bot.sendMessage(chatId, "Нет черновика.");
+
+      if (!draft.title || !draft.imageUrl || !draft.channelId || !draft.endAt) {
+        return bot.sendMessage(
+          chatId,
+          "❗ Для публикации нужно указать:\n— фото\n— название\n— подключить канал (перешлите сообщение из канала)\n— время окончания"
+        );
+      }
+
+      // публикуем пост с WebApp рулеткой
+      const url = `${RENDER_URL}/giveaway/?id=${draft._id.toString()}`;
+
+      await bot.sendPhoto(
+        draft.channelId,
+        draft.imageUrl,
+        {
+          caption:
+            `🎁 *${draft.title}*\n\nУчаствуйте в розыгрыше!\nНажмите кнопку ниже, чтобы попасть в список участников.`,
+          parse_mode: "Markdown",
+          reply_markup: {
+            inline_keyboard: [
+              [
+                {
+                  text: "🎉 Участвовать",
+                  url,
+                },
+              ],
+            ],
+          },
+        }
+      );
+
+      await updateRaffle(draft._id, { status: "active" });
+
+      return bot.sendMessage(chatId, "Розыгрыш опубликован!");
+    }
+
+  } catch (err) {
+    console.error("callback raffle:", err);
+  } finally {
+    bot.answerCallbackQuery(id).catch(() => {});
+  }
+});
+
+// =========================================================
+// ================== MESSAGE HANDLER (РОЗЫГРЫШИ) ==========
+// =========================================================
+
+bot.on("message", async (msg) => {
+  const text = msg.text || "";
+  const uid = msg.from.id;
+  const chatId = msg.chat.id;
+
+  // ---------- загружаем фото ----------
+  if (raffleWaitImage.has(uid) && msg.photo) {
+    raffleWaitImage.delete(uid);
+
+    const fileId = msg.photo[msg.photo.length - 1].file_id;
+    const link = await bot.getFileLink(fileId);
+
+    const draft = await getActiveDraft(uid);
+    await updateRaffle(draft._id, { imageUrl: link });
+
+    return bot.sendMessage(chatId, "Фото загружено ✓");
+  }
+
+  // ---------- заголовок ----------
+  if (raffleWaitTitle.has(uid) && text && !text.startsWith("/")) {
+    raffleWaitTitle.delete(uid);
+
+    const draft = await getActiveDraft(uid);
+    await updateRaffle(draft._id, { title: text });
+
+    return bot.sendMessage(chatId, "Название сохранено ✓");
+  }
+
+  // ---------- каналы для подписки ----------
+  if (raffleWaitSubs.has(uid) && text && !text.startsWith("/")) {
+    raffleWaitSubs.delete(uid);
+
+    const draft = await getActiveDraft(uid);
+
+    if (text.toLowerCase() === "нет") {
+      await updateRaffle(draft._id, { requiredSubs: [] });
+      return bot.sendMessage(chatId, "Требуемые подписки очищены ✓");
+    }
+
+    const list = text
+      .split(/\s+/)
+      .map((x) => x.trim())
+      .filter((x) => x.startsWith("@"));
+
+    await updateRaffle(draft._id, { requiredSubs: list });
+
+    return bot.sendMessage(chatId, "Подписки сохранены ✓");
+  }
+
+  // ---------- время ----------
+  if (raffleWaitTime.has(uid) && text.includes("|")) {
+    raffleWaitTime.delete(uid);
+
+    try {
+      const [startRaw, endRaw] = text.split("|").map((x) => x.trim());
+
+      const startAt = new Date(startRaw);
+      const endAt = new Date(endRaw);
+
+      const draft = await getActiveDraft(uid);
+      await updateRaffle(draft._id, { startAt, endAt });
+
+      return bot.sendMessage(chatId, "Время установлено ✓");
+    } catch {
+      return bot.sendMessage(chatId, "Ошибка формата. Попробуйте снова.");
+    }
+  }
+
+  // ---------- подключение канала ----------
+  if (msg.forward_from_chat && msg.forward_from_chat.type === "channel") {
+    const draft = await getActiveDraft(uid);
+    if (draft) {
+      await updateRaffle(draft._id, { channelId: msg.forward_from_chat.id });
+      return bot.sendMessage(chatId, "Канал подключён ✓");
+    }
+  }
+
+  // ---------- ПРОЧИЕ КОМАНДЫ НЕ ПЕРЕБИВАЕМ ----------
+});
+  
+// ======================================================================
+// =============== API ДЛЯ WEBAPP (РУЛЕТКА) ==============================
+// ======================================================================
+
+app.get("/api/raffle", async (req, res) => {
+  try {
+    const id = req.query.id;
+    if (!id) return res.json({ ok: false });
+
+    const raffle = await getRaffle(id);
+    if (!raffle) return res.json({ ok: false });
+
+    res.json({
+      ok: true,
+      participants: raffle.participants || [],
+      endAt: raffle.endAt,
+      title: raffle.title,
+    });
+  } catch (err) {
+    console.error("api raffle error:", err);
+    res.json({ ok: false });
+  }
+});
+
+// регистрация участника
+app.get("/api/join", async (req, res) => {
+  try {
+    const id = req.query.id;
+    const nick = req.query.nick;
+
+    if (!id || !nick) return res.json({ ok: false });
+
+    await addParticipant(id, nick);
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("join error:", err);
+    res.json({ ok: false });
+  }
+});
+
+// ======================================================================
+// ================== СТАРЫЙ КОД ОБРАБОТКИ СТРИМОВ =======================
+// ======================================================================
+// !!! ВАЖНО: здесь остаётся всё ТОЧНО как было у тебя !!!
+import express from "express";
+import TelegramBot from "node-telegram-bot-api";
+import axios from "axios";
 import { MongoClient } from "mongodb";
 import WebSocket from "ws";
 
