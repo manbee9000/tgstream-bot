@@ -78,7 +78,7 @@ app.get("/webapp", (req, res) => {
   `);
 });
 
-// ====== выдача фронтенда рулетки
+// ====== выдача фронтенда рулетки (мини-приложение)
 app.use("/giveaway", express.static("webapp/giveaway"));
 
 // ================== HELPERS СТРИМОВ ==================
@@ -411,9 +411,6 @@ function buildDonateUrl(orderId, amount) {
 // ⚠ Сейчас делаем всё бесплатным: просто возвращаем true
 async function ensureBalanceForPost(tgId, chatId) {
   return true;
-
-  // СТАРАЯ ЛОГИКА НА БУДУЩЕЕ:
-  // ...
 }
 
 async function chargeForPost(tgId) {
@@ -845,17 +842,15 @@ bot.onText(/\/da/, async (msg) => {
   );
 });
 
-// /giveaway — меню розыгрышей
-bot.onText(/\/giveaway/, async (msg) => {
-  const uid = msg.from.id;
-
+// helper для открытия меню розыгрышей
+async function openGiveawayMenu(uid, chatId) {
   let draft = await getActiveDraft(uid);
   if (!draft) {
     draft = await createDraftRaffle(uid);
   }
 
   await bot.sendMessage(
-    msg.chat.id,
+    chatId,
     "🎁 *Меню розыгрышей*\n\nВыберите действие:",
     {
       parse_mode: "Markdown",
@@ -871,6 +866,12 @@ bot.onText(/\/giveaway/, async (msg) => {
       },
     }
   );
+}
+
+// /giveaway — меню розыгрышей
+bot.onText(/\/giveaway/, async (msg) => {
+  const uid = msg.from.id;
+  await openGiveawayMenu(uid, msg.chat.id);
 });
 
 // ==========================================
@@ -896,26 +897,24 @@ bot.onText(/\/start/, async (msg) => {
       keyboard: [
         [
           { text: "🎁 Создать розыгрыш" },
-          { text: "📋 Мои розыгрыши" }
+          { text: "📋 Мои розыгрыши" },
         ],
         [
           { text: "📣 Мои каналы" },
-          { text: "⚙️ Подключить донат" }
+          { text: "⚙️ Подключить донат" },
         ],
         [
           { text: "🎥 Отправить стрим" },
-          { text: "⭐ Поддержать бота" }
+          { text: "⭐ Поддержать бота" },
         ],
-        [
-          { text: "📘 Инструкция" }
-        ]
+        [{ text: "📘 Инструкция" }],
       ],
-      resize_keyboard: true
-    }
+      resize_keyboard: true,
+    },
   });
 });
 
-// /balance пока оставляем (но платёж фактически не используется)
+// /balance пока оставляем (на будущее)
 bot.onText(/\/balance/, async (msg) => {
   const user = await getOrCreateUser(msg.from.id);
   const bal = user.balance || 0;
@@ -990,12 +989,20 @@ bot.on("callback_query", async (query) => {
 
       const url = `${RENDER_URL}/giveaway/?id=${draft._id.toString()}`;
 
+      // ВАЖНО: web_app, а не обычный URL — открывает мини-приложение
       await bot.sendPhoto(draft.channelId, draft.imageUrl, {
         caption:
           `🎁 *${draft.title}*\n\nУчаствуйте в розыгрыше!\nНажмите кнопку ниже, чтобы попасть в список участников.`,
         parse_mode: "Markdown",
         reply_markup: {
-          inline_keyboard: [[{ text: "🎉 Участвовать", url }]],
+          inline_keyboard: [
+            [
+              {
+                text: "🎉 Участвовать",
+                web_app: { url },
+              },
+            ],
+          ],
         },
       });
 
@@ -1076,72 +1083,214 @@ bot.on("callback_query", async (query) => {
 });
 
 // ==========================================
-// =========== ОБРАБОТКА КНОПОК МЕНЮ =========
+// ===== ОБЩИЙ ОБРАБОТЧИК MESSAGE ===========
 // ==========================================
 bot.on("message", async (msg) => {
-  const text = msg.text;
-  const chatId = msg.chat.id;
-  const uid = msg.from.id;
+  try {
+    const text = msg.text || "";
+    const uid = msg.from.id;
+    const chatId = msg.chat.id;
 
-  // 📌 Создать розыгрыш
-  if (text === "🎁 Создать розыгрыш") {
-    return bot.emit("text", { ...msg, text: "/giveaway" });
-  }
+    // ===== КНОПКИ ГЛАВНОГО МЕНЮ =====
 
-  // 📌 Мои розыгрыши (позже можно сделать список черновиков + активных)
-  if (text === "📋 Мои розыгрыши") {
-    return bot.sendMessage(chatId, "Ваши розыгрыши появятся здесь (в разработке).");
-  }
+    if (text === "🎁 Создать розыгрыш") {
+      await openGiveawayMenu(uid, chatId);
+      return;
+    }
 
-  // 📌 Мои каналы — подсказка как подключить
-  if (text === "📣 Мои каналы") {
-    return bot.sendMessage(
+    if (text === "📋 Мои розыгрыши") {
+      await bot.sendMessage(
+        chatId,
+        "Ваши розыгрыши появятся здесь (в разработке)."
+      );
+      return;
+    }
+
+    if (text === "📣 Мои каналы") {
+      await bot.sendMessage(
+        chatId,
+        "Чтобы подключить канал:\n\n" +
+          "1. Добавьте бота в администраторы канала\n" +
+          "2. Отправьте любое сообщение из канала сюда (перешлите его)"
+      );
+      return;
+    }
+
+    if (text === "⚙️ Подключить донат") {
+      await bot.sendMessage(
+        chatId,
+        "Введите команду в формате:\n\n`/donate ваш_донат_нейм`\n" +
+          "Пример:\n`/donate volnaae_donate`",
+        { parse_mode: "Markdown" }
+      );
+      return;
+    }
+
+    if (text === "🎥 Отправить стрим") {
+      await bot.sendMessage(
+        chatId,
+        "Отправьте ссылку на стрим YouTube или Twitch — бот опубликует её в вашем канале."
+      );
+      return;
+    }
+
+    if (text === "⭐ Поддержать бота") {
+      await bot.sendMessage(
+        chatId,
+        "Спасибо за поддержку 😍\n\n" + DA_DONATE_URL
+      );
+      return;
+    }
+
+    if (text === "📘 Инструкция") {
+      await bot.sendMessage(
+        chatId,
+        "📘 *Краткая инструкция по боту:*\n\n" +
+          "• 🎁 Создавайте розыгрыши через меню\n" +
+          "• 🎥 Отправляйте стримы просто прислав ссылку\n" +
+          "• 📣 Подключение канала — переслать сообщение из него\n" +
+          "• ⚙️ Подключение доната — команда `/donate`\n" +
+          "• ⭐ Поддержать — помогает содержать сервер\n\n" +
+          "Если нужна помощь — я рядом ❤️",
+        { parse_mode: "Markdown" }
+      );
+      return;
+    }
+
+    // ===== ШАГИ МАСТЕРА РОЗЫГРЫША =====
+
+    // 1) Фото
+    if (raffleWaitImage.has(uid) && msg.photo) {
+      raffleWaitImage.delete(uid);
+
+      const fileId = msg.photo[msg.photo.length - 1].file_id;
+      const link = await bot.getFileLink(fileId);
+
+      const draft = await getActiveDraft(uid);
+      if (draft) await updateRaffle(draft._id, { imageUrl: link });
+
+      await bot.sendMessage(chatId, "Фото загружено ✓");
+      return;
+    }
+
+    // 2) Название
+    if (raffleWaitTitle.has(uid) && text && !text.startsWith("/")) {
+      raffleWaitTitle.delete(uid);
+
+      const draft = await getActiveDraft(uid);
+      if (draft) await updateRaffle(draft._id, { title: text });
+
+      await bot.sendMessage(chatId, "Название сохранено ✓");
+      return;
+    }
+
+    // 3) Требуемые подписки
+    if (raffleWaitSubs.has(uid) && text && !text.startsWith("/")) {
+      raffleWaitSubs.delete(uid);
+
+      const draft = await getActiveDraft(uid);
+      if (!draft) return;
+
+      if (text.toLowerCase() === "нет") {
+        await updateRaffle(draft._id, { requiredSubs: [] });
+        await bot.sendMessage(chatId, "Требуемые подписки очищены ✓");
+        return;
+      }
+
+      const list = text
+        .split(/\s+/)
+        .map((x) => x.trim())
+        .filter((x) => x.startsWith("@"));
+
+      await updateRaffle(draft._id, { requiredSubs: list });
+
+      await bot.sendMessage(chatId, "Подписки сохранены ✓");
+      return;
+    }
+
+    // 4) Время старта/конца
+    if (raffleWaitTime.has(uid) && text.includes("|")) {
+      raffleWaitTime.delete(uid);
+
+      try {
+        const [startRaw, endRaw] = text.split("|").map((x) => x.trim());
+        const startAt = new Date(startRaw);
+        const endAt = new Date(endRaw);
+
+        const draft = await getActiveDraft(uid);
+        if (draft) await updateRaffle(draft._id, { startAt, endAt });
+
+        await bot.sendMessage(chatId, "Время установлено ✓");
+      } catch {
+        await bot.sendMessage(chatId, "Ошибка формата. Попробуйте снова.");
+      }
+      return;
+    }
+
+    // Подключение канала к розыгрышу ИЛИ к стримам
+    if (msg.forward_from_chat && msg.forward_from_chat.type === "channel") {
+      const draft = await getActiveDraft(uid);
+      if (draft) {
+        await updateRaffle(draft._id, { channelId: msg.forward_from_chat.id });
+        await bot.sendMessage(chatId, "Канал подключён к розыгрышу ✓");
+        return;
+      }
+
+      // если нет черновика — используем как канал для стримов
+      streamerConfig[uid] = streamerConfig[uid] || {};
+      streamerConfig[uid].channelId = msg.forward_from_chat.id;
+
+      await bot.sendMessage(
+        chatId,
+        `Канал подключён: ${msg.forward_from_chat.title}.\nТеперь отправьте ссылку на стрим.`
+      );
+      return;
+    }
+
+    // ===== ПРОМОКОД =====
+    if (
+      promoWaitingUsers.has(uid) &&
+      text &&
+      !text.startsWith("/") &&
+      !msg.forward_from_chat
+    ) {
+      promoWaitingUsers.delete(uid);
+      const code = text.trim();
+      const res = await applyPromocode(uid, code);
+      await bot.sendMessage(chatId, res.message);
+      return;
+    }
+
+    // ===== ЛОГИКА СТРИМОВ =====
+
+    if (text.startsWith("/")) return;
+    if (!text.startsWith("http://") && !text.startsWith("https://")) return;
+
+    const cfg = streamerConfig[uid];
+    if (!cfg || !cfg.channelId) {
+      await bot.sendMessage(
+        chatId,
+        "Сначала подключите канал:\n1. Добавьте бота в админы.\n2. Перешлите сообщение из канала сюда."
+      );
+      return;
+    }
+
+    const enough = await ensureBalanceForPost(uid, chatId);
+    if (!enough) return;
+
+    const embed = getEmbed(text);
+    const thumb = await getThumbnail(text);
+
+    await publishStreamPost(cfg.channelId, embed, thumb, cfg.donateName);
+    await chargeForPost(uid);
+
+    const user = await getOrCreateUser(uid);
+    await bot.sendMessage(
       chatId,
-      "Чтобы подключить канал:\n\n" +
-      "1. Добавьте бота в администраторы канала\n" +
-      "2. Отправьте любое сообщение из канала сюда"
+      `Готово! Баланс: ${Math.round(user.balance || 0)} ₽.`
     );
-  }
-
-  // 📌 Подключить донат — просто инструкция
-  if (text === "⚙️ Подключить донат") {
-    return bot.sendMessage(
-      chatId,
-      "Введите команду в формате:\n\n`/donate ваш_донат_нейм`\n" +
-      "Пример:\n`/donate volnaae_donate`",
-      { parse_mode: "Markdown" }
-    );
-  }
-
-  // 📌 Отправить стрим — инструкция
-  if (text === "🎥 Отправить стрим") {
-    return bot.sendMessage(
-      chatId,
-      "Отправьте ссылку на стрим YouTube или Twitch — бот опубликует её в вашем канале."
-    );
-  }
-
-  // 📌 Поддержать бота — просто переход
-  if (text === "⭐ Поддержать бота") {
-    return bot.sendMessage(
-      chatId,
-      "Спасибо за поддержку 😍\n\n" + DA_DONATE_URL
-    );
-  }
-
-  // 📌 Инструкция
-  if (text === "📘 Инструкция") {
-    return bot.sendMessage(
-      chatId,
-      "📘 *Краткая инструкция по боту:*\n\n" +
-      "• 🎁 Создавайте розыгрыши через меню\n" +
-      "• 🎥 Отправляйте стримы просто прислав ссылку\n" +
-      "• 📣 Подключение канала — переслать сообщение из него\n" +
-      "• ⚙️ Подключение доната — команда `/donate`\n" +
-      "• ⭐ Поддержать — помогает содержать сервер\n\n" +
-      "Если нужна помощь — я рядом ❤️",
-      { parse_mode: "Markdown" }
-    );
+  } catch (err) {
+    console.error("msg error:", err);
   }
 });
 
@@ -1160,8 +1309,9 @@ app.get("/api/raffle", async (req, res) => {
     res.json({
       ok: true,
       participants: raffle.participants || [],
-      endAt: raffle.endAt,
-      title: raffle.title,
+      endAt: raffle.endAt || null,
+      title: raffle.title || "",
+      requiredSubs: raffle.requiredSubs || [],
     });
   } catch (err) {
     console.error("api raffle error:", err);
@@ -1169,19 +1319,75 @@ app.get("/api/raffle", async (req, res) => {
   }
 });
 
+// регистрация участника из WebApp
 app.get("/api/join", async (req, res) => {
   try {
     const id = req.query.id;
-    const nick = req.query.nick;
+    const userId = req.query.userId;
+    const username = req.query.username || "";
+    const nickFallback = req.query.nick; // на всякий случай, для тестов
 
-    if (!id || !nick) return res.json({ ok: false });
+    if (!id) return res.json({ ok: false, error: "NO_ID" });
 
-    await addParticipant(id, nick);
+    const raffle = await getRaffle(id);
+    if (!raffle) return res.json({ ok: false, error: "NO_RAFFLE" });
 
-    res.json({ ok: true });
+    // проверяем, не завершился ли розыгрыш
+    if (raffle.endAt) {
+      const now = new Date();
+      const end = new Date(raffle.endAt);
+      if (end.getTime() <= now.getTime()) {
+        return res.json({ ok: false, error: "ENDED" });
+      }
+    }
+
+    let nickname;
+
+    // Основной путь: WebApp передаёт userId и username
+    if (userId) {
+      nickname = username ? `@${username}` : `id:${userId}`;
+
+      const required = raffle.requiredSubs || [];
+      const notSubs = [];
+
+      for (const ch of required) {
+        const chatId = ch.trim();
+        if (!chatId) continue;
+
+        try {
+          // bot.getChatMember умеет работать с @username
+          const member = await bot.getChatMember(chatId, Number(userId));
+          const st = member.status;
+          if (!["creator", "administrator", "member"].includes(st)) {
+            notSubs.push(chatId);
+          }
+        } catch (e) {
+          console.error("getChatMember error:", e.message);
+          // если бот не админ/нет доступа — считаем, что проверить не можем
+          notSubs.push(chatId);
+        }
+      }
+
+      if (notSubs.length) {
+        return res.json({
+          ok: false,
+          error: "NOT_SUBSCRIBED",
+          notSubs,
+        });
+      }
+    } else if (nickFallback) {
+      // Резервный вариант: можно дернуть вручную /api/join?id=...&nick=...
+      nickname = String(nickFallback);
+    } else {
+      return res.json({ ok: false, error: "NO_USER" });
+    }
+
+    await addParticipant(id, nickname);
+
+    return res.json({ ok: true });
   } catch (err) {
     console.error("join error:", err);
-    res.json({ ok: false });
+    res.json({ ok: false, error: "SERVER_ERROR" });
   }
 });
 
