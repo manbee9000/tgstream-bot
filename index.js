@@ -910,6 +910,9 @@ async function publishRafflePost(raffle) {
     throw new Error("У розыгрыша нет channelId");
   }
 
+  // deep-link в бота с payload raffle_<id>
+  const deepLink = `https://t.me/${BOT_USERNAME}?start=raffle_${raffle._id.toString()}`;
+
   const captionLines = [];
   captionLines.push("🎁 *Розыгрыш*");
   if (raffle.text) {
@@ -918,44 +921,32 @@ async function publishRafflePost(raffle) {
   }
   captionLines.push("");
   captionLines.push("Нажмите кнопку ниже, чтобы участвовать.");
-
   const caption = captionLines.join("\n");
 
-  //
-  // 1) Если фото ➜ сначала отправляем фото БЕЗ кнопок
-  //
+  // ВАЖНО: в канале — ТОЛЬКО url-кнопка, БЕЗ web_app
+  const reply_markup = {
+    inline_keyboard: [
+      [
+        {
+          text: "🎉 Участвовать",
+          url: deepLink,
+        },
+      ],
+    ],
+  };
+
   if (raffle.imageFileId) {
     await bot.sendPhoto(channelId, raffle.imageFileId, {
       caption,
-      parse_mode: "Markdown"
+      parse_mode: "Markdown",
+      reply_markup,
     });
   } else {
-    //
-    // 1.b) если фото нет — сразу текст
-    //
     await bot.sendMessage(channelId, caption, {
-      parse_mode: "Markdown"
+      parse_mode: "Markdown",
+      reply_markup,
     });
   }
-
-  //
-  // 2) Вторым сообщением отправляем кнопку "Участвовать" (web_app)
-  //
-  await bot.sendMessage(channelId,
-    "🎉 Чтобы участвовать, нажмите кнопку ниже:",
-    {
-      reply_markup: {
-        inline_keyboard: [[
-          {
-            text: "🎉 Участвовать",
-            web_app: {
-              url: `${RENDER_URL}/giveaway/?id=${raffle._id}`
-            }
-          }
-        ]]
-      }
-    }
-  );
 }
 
 // ================== ГЛАВНОЕ МЕНЮ /start ==================
