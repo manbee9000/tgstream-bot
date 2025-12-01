@@ -1,53 +1,41 @@
-// ============================================================
-// Получение параметров
-// ============================================================
+// ===============================
+// READ URL PARAM
+// ===============================
 const params = new URLSearchParams(window.location.search);
 const raffleId = params.get("id");
 
-// Элементы UI
 const list = document.getElementById("nickname-list");
 const timerValue = document.getElementById("timer-value");
 const joinBtn = document.getElementById("join-btn");
 
-// ============================================================
-// Telegram WebApp INIT
-// ============================================================
-let tg = window.Telegram?.WebApp || null;
-let tgUser = null;
-
-function initTelegram() {
-  if (!tg) return;
-
-  try {
-    tg.expand();
-    tg.ready();
-
-    // Данные пользователя
-    if (tg.initDataUnsafe && tg.initDataUnsafe.user) {
-      tgUser = tg.initDataUnsafe.user;
-    }
-  } catch (e) {
-    console.warn("TG init error:", e);
-  }
-}
-
-// Инициализация с задержкой (Telegram иногда отдает данные не сразу)
-setTimeout(initTelegram, 30);
-
-// ============================================================
-// Участники + время
-// ============================================================
 let participants = [];
 let endAt = null;
 let myNickKey = null;
 
-// ============================================================
-// Рендер списка
-// ============================================================
+// ===============================
+// TELEGRAM WEBAPP BASE
+// ===============================
+const tg = window.Telegram?.WebApp || null;
+
+if (tg) {
+  tg.expand();
+  tg.ready();
+
+  // здесь нормальный способ получить авторизованного юзера
+  if (tg.initDataUnsafe && tg.initDataUnsafe.user) {
+    const u = tg.initDataUnsafe.user;
+    myNickKey = u.username ? `@${u.username}` : `id:${u.id}`;
+  }
+}
+
+// ===============================
+// RENDER LIST
+// ===============================
 function renderList() {
   list.innerHTML = "";
 
   const arr = participants.length ? participants : ["Пока нет участников"];
+
   arr.forEach((nick) => {
     const item = document.createElement("div");
     item.className = "nickname";
@@ -56,18 +44,19 @@ function renderList() {
   });
 }
 
-// ============================================================
-// Таймер обратного отсчёта
-// ============================================================
+// ===============================
+// TIMER
+// ===============================
 function updateTimer() {
   if (!endAt) return;
 
   const now = new Date();
-  let diff = Math.floor((endAt.getTime() - now.getTime()) / 1000);
+  let diff = Math.floor((endAt - now) / 1000);
 
   if (diff <= 0) {
     timerValue.textContent = "00:00:00";
     joinBtn.disabled = true;
+
     if (!joinBtn.textContent.startsWith("✅")) {
       joinBtn.textContent = "Розыгрыш завершён";
     }
@@ -84,9 +73,9 @@ function updateTimer() {
 
 setInterval(updateTimer, 1000);
 
-// ============================================================
-// Бесконечная прокрутка
-// ============================================================
+// ===============================
+// SCROLL ANIMATION
+// ===============================
 let position = 0;
 const ITEM_HEIGHT = 48;
 
@@ -96,7 +85,7 @@ function animate() {
     return;
   }
 
-  position -= 0.7;
+  position -= 0.5;
   list.style.transform = `translateY(${position}px)`;
 
   const totalHeight = list.children.length * ITEM_HEIGHT;
@@ -106,17 +95,19 @@ function animate() {
 
   requestAnimationFrame(animate);
 }
+
 animate();
 
-// ============================================================
-// Загрузка розыгрыша
-// ============================================================
+// ===============================
+// LOAD RAFFLE DATA
+// ===============================
 async function loadRaffle() {
   if (!raffleId) return;
 
   try {
     const resp = await fetch(`/api/raffle?id=${encodeURIComponent(raffleId)}`);
     const data = await resp.json();
+
     if (!data.ok) return;
 
     participants = data.participants || [];
@@ -125,35 +116,31 @@ async function loadRaffle() {
     renderList();
     updateTimer();
 
-    if (tgUser) {
-      const n = tgUser.username ? `@${tgUser.username}` : `id:${tgUser.id}`;
-      if (participants.includes(n)) {
-        joinBtn.textContent = "✅ Вы участвуете";
-        joinBtn.disabled = true;
-      }
+    if (myNickKey && participants.includes(myNickKey)) {
+      joinBtn.textContent = "✅ Вы участвуете";
+      joinBtn.disabled = true;
     }
   } catch (e) {
     console.error("loadRaffle error:", e);
   }
 }
 
-// ============================================================
-// Участвовать → API JOIN
-// ============================================================
+// ===============================
+// JOIN
+// ===============================
 joinBtn.addEventListener("click", async () => {
   if (!raffleId) return;
 
-  // Telegram не виден → юзер открыл в браузере
-  if (!tg || !tgUser) {
+  // НЕ ДЕЛАЕМ alert — просто меняем текст
+  if (!tg || !tg.initDataUnsafe || !tg.initDataUnsafe.user) {
     joinBtn.textContent = "Ошибка авторизации";
     joinBtn.disabled = true;
-    console.warn("TG WebApp user not found");
     return;
   }
 
-  const userId = tgUser.id;
-  const username = tgUser.username || "";
-  const display = username ? `@${username}` : `id:${userId}`;
+  const u = tg.initDataUnsafe.user;
+  const userId = u.id;
+  const username = u.username || "";
 
   try {
     const url =
@@ -165,31 +152,45 @@ joinBtn.addEventListener("click", async () => {
     const data = await resp.json();
 
     if (data.ok) {
+      myNickKey = username ? `@${username}` : `id:${userId}`;
+
       joinBtn.textContent = "✅ Вы участвуете";
       joinBtn.disabled = true;
-      myNickKey = display;
+
       await loadRaffle();
-    } else {
-      if (data.error === "NOT_SUBSCRIBED") {
-        alert(
-          "Чтобы участвовать, подпишитесь на каналы:\n" +
-            data.notSubs.join("\n")
-        );
-      } else if (data.error === "ENDED") {
-        alert("Розыгрыш уже завершён.");
-        joinBtn.disabled = true;
-        joinBtn.textContent = "Розыгрыш завершён";
-      } else {
-        alert("Ошибка, попробуйте позже.");
-      }
+      return;
     }
+
+    // если нет подписки
+    if (data.error === "NOT_SUBSCRIBED" && Array.isArray(data.notSubs)) {
+      joinBtn.textContent = "❗ Подпишитесь на каналы";
+      joinBtn.disabled = false;
+
+      setTimeout(() => {
+        joinBtn.textContent = "🎉 Участвовать";
+      }, 2500);
+
+      return;
+    }
+
+    if (data.error === "ENDED") {
+      joinBtn.textContent = "Розыгрыш завершён";
+      joinBtn.disabled = true;
+      return;
+    }
+
+    joinBtn.textContent = "Ошибка";
+    setTimeout(() => {
+      joinBtn.textContent = "🎉 Участвовать";
+    }, 2000);
+
   } catch (e) {
-    console.error("join error:", e);
-    alert("Ошибка подключения к серверу.");
+    joinBtn.textContent = "Сеть недоступна";
+    setTimeout(() => {
+      joinBtn.textContent = "🎉 Участвовать";
+    }, 2000);
   }
 });
 
-// ============================================================
-// Старт
-// ============================================================
+// ===============================
 loadRaffle();
