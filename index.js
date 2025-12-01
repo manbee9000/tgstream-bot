@@ -923,7 +923,10 @@ async function publishRafflePost(raffle) {
   const caption = captionLines.join("\n");
 
   const reply_markup = {
-    inline_keyboard: [[{ text: "🎉 Участвовать", url: deepLink }]],
+    inline_keyboard: [[{
+  text: "🎉 Участвовать",
+  web_app: { url: `${RENDER_URL}/giveaway/?id=${raffle._id}` }
+}]]
   };
 
   if (raffle.imageFileId) {
