@@ -1116,8 +1116,7 @@ bot.on("message", async (msg) => {
 
         if (msg.photo && msg.photo.length > 0) {
           const fileId = msg.photo[msg.photo.length - 1].file_id;
-          const link = await bot.getFileLink(fileId);
-          imageUrl = link;
+          imageUrl = fileId; // Сохраняем file_id, Telegram сам отдаст фото
 
           if (msg.caption && msg.caption.trim()) {
             description = msg.caption.trim();
